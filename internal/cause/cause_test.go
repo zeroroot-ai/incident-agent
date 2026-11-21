@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -42,7 +43,7 @@ func (f *fakeFindings) SubmitFinding(_ context.Context, in *finding.Finding) err
 		return nil
 	}
 	cp := *in
-	cp.ID = "daemon-id-" + string(rune('a'+len(f.stored)))
+	cp.ID = fmt.Sprintf("daemon-id-%d", len(f.stored)+1)
 	f.stored = append(f.stored, &cp)
 	return nil
 }
@@ -92,7 +93,7 @@ func TestRaise_RaisesOneFindingAndLinksIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fs.submitted != 1 || res.FindingID != "daemon-id-a" || res.Reused || res.Existing {
+	if fs.submitted != 1 || res.FindingID != "daemon-id-1" || res.Reused || res.Existing {
 		t.Fatalf("res %+v submitted %d", res, fs.submitted)
 	}
 	f := fs.stored[0]
@@ -106,7 +107,7 @@ func TestRaise_RaisesOneFindingAndLinksIt(t *testing.T) {
 		t.Errorf("remediation %q evidence %d", f.Remediation, len(f.Evidence))
 	}
 	// The places are numbered in a fixed order: Account before Host.
-	if len(ln.links) != 1 || ln.links[0].finding != "daemon-id-a" || ln.links[0].place.Key != "acct-a" {
+	if len(ln.links) != 1 || ln.links[0].finding != "daemon-id-1" || ln.links[0].place.Key != "acct-a" {
 		t.Errorf("links = %+v", ln.links)
 	}
 	var msg struct {
@@ -141,7 +142,7 @@ func TestRaise_ASecondRunLinksTheFirstFinding(t *testing.T) {
 	// The model writes another title in the second run.
 	llm.answer = strings.Replace(goodAnswer, "MFA is not required", "No MFA", 1)
 	res, err := step.Raise(context.Background(), oneIncident())
-	if err != nil || !res.Reused || res.FindingID != "daemon-id-a" || fs.submitted != 1 {
+	if err != nil || !res.Reused || res.FindingID != "daemon-id-1" || fs.submitted != 1 {
 		t.Fatalf("res %+v err %v submitted %d", res, err, fs.submitted)
 	}
 }

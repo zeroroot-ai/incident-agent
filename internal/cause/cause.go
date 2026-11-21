@@ -154,14 +154,14 @@ func (s Step) Raise(ctx context.Context, inc incident.Incident) (Result, error) 
 // prefix of the incident. The prefix holds a hash of the incident key, so two
 // incidents never share one. A second run finds the finding of the first run
 // by the prefix, also when the model wrote another title.
-func (s Step) submit(ctx context.Context, prefix string, f *finding.Finding) (string, bool, error) {
-	if id, err := s.byPrefix(ctx, prefix); err != nil || id != "" {
+func (s Step) submit(ctx context.Context, prefix string, f *finding.Finding) (id string, reused bool, err error) {
+	if id, err = s.byPrefix(ctx, prefix); err != nil || id != "" {
 		return id, id != "", err
 	}
-	if err := s.Findings.SubmitFinding(ctx, f); err != nil {
+	if err = s.Findings.SubmitFinding(ctx, f); err != nil {
 		return "", false, fmt.Errorf("cause: submit the finding: %w", err)
 	}
-	id, err := s.byPrefix(ctx, prefix)
+	id, err = s.byPrefix(ctx, prefix)
 	if err != nil {
 		return "", false, err
 	}
