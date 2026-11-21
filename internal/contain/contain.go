@@ -260,12 +260,12 @@ func (p Pass) Release(ctx context.Context, key string) (Summary, error) {
 // confirm opens nothing, and the next write of the agent takes its name.
 func (p Pass) generation(
 	ctx context.Context, inc incident.Incident, t respond.Target, sum *Summary,
-) (int, bool, error) {
+) (gen int, active bool, err error) {
 	mark, ok := markStep(t)
 	if !ok {
 		return 1, false, nil
 	}
-	gen := emit.LastGeneration(inc.Records, t, mark)
+	gen = emit.LastGeneration(inc.Records, t, mark)
 	if gen == 0 {
 		return 1, false, nil
 	}
@@ -273,11 +273,11 @@ func (p Pass) generation(
 		return gen + 1, false, nil
 	}
 	a := respond.Action{Kind: respond.KindContain, Target: t, Tool: mark.Tool}
-	owned, err := p.owned(ctx, inc, emit.ContainedName(t, mark, gen), a, sum)
+	active, err = p.owned(ctx, inc, emit.ContainedName(t, mark, gen), a, sum)
 	if err != nil {
 		return 0, false, err
 	}
-	return gen, owned, nil
+	return gen, active, nil
 }
 
 // markStep returns the first step of the connector with an undo.
