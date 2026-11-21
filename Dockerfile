@@ -31,7 +31,7 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
 # 2026b-0+deb12u1 (measured 2026-10-02 on the newest index, sha256:52dcfbab).
 # static-debian13:nonroot ships 2026c-0+deb13u1. Move the digest here when a
 # scanner names a package in this image; never dismiss the alert.
-FROM gcr.io/distroless/static-debian13:nonroot@sha256:e2e927ec666bae08560abb3c55d0659eceabb657f56b6782ab500a9fc7f555e3 AS runtime
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:aafe993665bf6200db38a02c11a9351e782a84b6a45e7f33b6695638c88e3931 AS runtime
 
 # The binary sits at a stable, documented path because setec does NOT consult
 # the image ENTRYPOINT — a sandboxed catalog manifest names the command
