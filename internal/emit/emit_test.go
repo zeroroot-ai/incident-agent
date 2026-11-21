@@ -5,6 +5,8 @@ package emit_test
 
 import (
 	"context"
+	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/zeroroot-ai/incident-agent/internal/emit"
@@ -39,45 +41,103 @@ func result(t *testing.T, kind respond.Kind, out respond.Outcome) respond.Result
 	return respond.Result{Action: respond.Action{Kind: kind, Target: tg, Tool: tool}, Outcome: out, Detail: "why"}
 }
 
-func TestRecordName(t *testing.T) {
-	for _, tc := range []struct {
-		kind respond.Kind
-		out  respond.Outcome
-		want string
-	}{
-		{respond.KindContain, respond.OutcomeDone, "contained.mcp:defender-endpoint-response:isolate_device." + mdeID},
-		{respond.KindRelease, respond.OutcomeDone, "released.mcp:defender-endpoint-response:release_device." + mdeID},
-		{
-			respond.KindContain, respond.OutcomePending,
-			"pending_authorization.mcp:defender-endpoint-response:isolate_device." + mdeID,
-		},
-		{respond.KindContain, respond.OutcomeRefused, "refused.mcp:defender-endpoint-response:isolate_device." + mdeID},
-	} {
-		r := result(t, tc.kind, tc.out)
-		if got := emit.RecordName(r); got != tc.want {
-			t.Errorf("RecordName = %s, want %s", got, tc.want)
-		}
-		if len(emit.RecordName(r)) > emit.MaxRecordNameBytes {
-			t.Errorf("%s is longer than the limit of the daemon", emit.RecordName(r))
+// projectorKeyPattern is copied from gibson, branch integration/blue-team,
+// internal/server/daemon/graph_projector_neo4j.go: safeTaxonomyLabel. The
+// projector keeps a property only when its name matches it
+// (entityUpsertParams), and it drops each other name with no error. The copy
+// is a literal on purpose: a change of emit.RecordNamePattern must not pass
+// this test.
+var projectorKeyPattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*$`)
+
+// Each record name that the agent can write must reach the Incident node. The
+// test builds the name of each outcome of each tool of each connector in the
+// table, in a low and a high generation, and the held record.
+func TestRecordName_EachNameIsKeptByTheProjector(t *testing.T) {
+	outcomes := []respond.Outcome{
+		respond.OutcomeDone, respond.OutcomePending, respond.OutcomeRefused,
+		respond.OutcomeFailed, respond.OutcomeUnknown,
+	}
+	names := []string{emit.RecordHeld}
+	for _, tg := range allTargets(t) {
+		for _, s := range tg.Connector.Steps {
+			for _, gen := range []int{1, emit.MaxGeneration} {
+				names = append(names, emit.ContainedName(tg, s, gen))
+				for _, out := range outcomes {
+					names = append(names, emit.RecordName(respond.Result{
+						Action:  respond.Action{Kind: respond.KindContain, Target: tg, Tool: s.Tool},
+						Outcome: out,
+					}, gen))
+				}
+				if s.Undo == "" {
+					continue
+				}
+				names = append(names, emit.ReleasedName(tg, s, gen))
+				for _, out := range outcomes {
+					names = append(names, emit.RecordName(respond.Result{
+						Action:  respond.Action{Kind: respond.KindRelease, Target: tg, Tool: s.Undo},
+						Outcome: out,
+					}, gen))
+				}
+			}
 		}
 	}
-	tg := result(t, respond.KindContain, respond.OutcomeDone).Action.Target
-	step := tg.Connector.Steps[0]
-	if emit.ContainedName(tg, step) != emit.RecordName(result(t, respond.KindContain, respond.OutcomeDone)) {
-		t.Error("ContainedName and RecordName of a done containment differ")
-	}
-	if emit.ReleasedName(tg, step) != emit.RecordName(result(t, respond.KindRelease, respond.OutcomeDone)) {
-		t.Error("ReleasedName and RecordName of a done release differ")
+	for _, n := range names {
+		if !projectorKeyPattern.MatchString(n) {
+			t.Errorf("the projector drops the record name %q", n)
+		}
+		if len(n) > emit.MaxRecordNameBytes {
+			t.Errorf("the record name %q is longer than %d bytes", n, emit.MaxRecordNameBytes)
+		}
 	}
 }
 
-func TestRecord_WritesOnePropertyOnTheIncident(t *testing.T) {
+func TestRecordName_PairsWithContainedAndReleased(t *testing.T) {
+	tg := result(t, respond.KindContain, respond.OutcomeDone).Action.Target
+	step := tg.Connector.Steps[0]
+	if emit.ContainedName(tg, step, 3) != emit.RecordName(result(t, respond.KindContain, respond.OutcomeDone), 3) {
+		t.Error("ContainedName and RecordName of a done containment differ")
+	}
+	if emit.ReleasedName(tg, step, 3) != emit.RecordName(result(t, respond.KindRelease, respond.OutcomeDone), 3) {
+		t.Error("ReleasedName and RecordName of a done release differ")
+	}
+	if emit.ContainedName(tg, step, 1) == emit.ContainedName(tg, step, 2) {
+		t.Error("two generations have one name")
+	}
+	if emit.RecordName(result(t, respond.KindContain, respond.OutcomePending), 1) ==
+		emit.RecordName(result(t, respond.KindContain, respond.OutcomeRefused), 1) {
+		t.Error("two outcomes have one name")
+	}
+	other := tg
+	other.VendorID = strings.Repeat("f", len(tg.VendorID))
+	if emit.ContainedName(tg, step, 1) == emit.ContainedName(other, step, 1) {
+		t.Error("two targets have one name")
+	}
+}
+
+func TestLastGeneration(t *testing.T) {
+	tg := result(t, respond.KindContain, respond.OutcomeDone).Action.Target
+	step := tg.Connector.Steps[0]
+	recs := map[string]string{}
+	if got := emit.LastGeneration(recs, tg, step); got != 0 {
+		t.Errorf("no record: %d", got)
+	}
+	recs[emit.ContainedName(tg, step, 1)] = "call-1"
+	recs[emit.ReleasedName(tg, step, 1)] = "call-2"
+	recs[emit.ContainedName(tg, step, 2)] = "call-3"
+	if got := emit.LastGeneration(recs, tg, step); got != 2 {
+		t.Errorf("two generations: %d", got)
+	}
+}
+
+func TestRecord_WritesTheCallIDOnTheIncident(t *testing.T) {
 	obs := &fakeObserver{}
 	e, err := emit.New(obs)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := e.Record(context.Background(), "inc-1", result(t, respond.KindContain, respond.OutcomeRefused)); err != nil {
+	r := result(t, respond.KindContain, respond.OutcomeDone)
+	r.CallID = "0b5e2c1a-0000-4000-8000-000000000001"
+	if err := e.Record(context.Background(), "inc-1", r, 1); err != nil {
 		t.Fatal(err)
 	}
 	if len(obs.got) != 1 {
@@ -87,9 +147,39 @@ func TestRecord_WritesOnePropertyOnTheIncident(t *testing.T) {
 	if o.Label != "Incident" || o.IDProperties["key"] != "inc-1" || len(o.Properties) != 1 || len(o.Edges) != 0 {
 		t.Errorf("observation = %+v", o)
 	}
-	if o.Properties["refused.mcp:defender-endpoint-response:isolate_device."+mdeID] != "why" {
-		t.Errorf("properties = %v", o.Properties)
+	if o.Properties[emit.ContainedName(r.Action.Target, r.Action.Target.Connector.Steps[0], 1)] != r.CallID {
+		t.Errorf("properties = %v, want the call id", o.Properties)
 	}
+	refused := result(t, respond.KindContain, respond.OutcomeRefused)
+	if err := e.Record(context.Background(), "inc-1", refused, 1); err != nil {
+		t.Fatal(err)
+	}
+	for k, v := range obs.got[1].Properties {
+		if v != string(respond.OutcomeRefused) {
+			t.Errorf("%s = %q, want the outcome for a call with no id", k, v)
+		}
+	}
+}
+
+// allTargets returns one target of each connector of the table.
+func allTargets(t *testing.T) []respond.Target {
+	t.Helper()
+	places := []incident.Place{
+		{Label: incident.LabelAccount, Key: placeKey("okta-response", "00ub0oNGTSWTBKOLGLNR")},
+		{Label: incident.LabelAccount, Key: placeKey("entra-id-response", "87d349ed-44d7-43e1-9a83-5f2406dee5bd")},
+		{Label: incident.LabelHost, Key: placeKey("crowdstrike-response", "0123456789abcdef0123456789abcdef")},
+		{Label: incident.LabelHost, Key: placeKey("defender-endpoint-response", mdeID)},
+		{Label: incident.LabelHost, Key: placeKey("sentinelone-response", "225494730938493804")},
+	}
+	out := make([]respond.Target, 0, len(places))
+	for _, p := range places {
+		tg, err := respond.ParseTarget(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, tg)
+	}
+	return out
 }
 
 func TestLinkCause_WritesCausedByAndAffects(t *testing.T) {

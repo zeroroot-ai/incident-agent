@@ -30,11 +30,16 @@ func (f *fakeLLM) Complete(_ context.Context, _, _, user string) (string, error)
 
 // fakeFindings acts as the daemon: SubmitFinding names the finding itself and
 // returns no id, and GetFindings returns the findings of the mission with the
-// id that the daemon gave (agentFindingToProto in gibson).
+// id that the daemon gave. The daemon keeps the title, the description, the
+// category and the severity, and drops the tags and the author
+// (protoFindingToFinding and agentFindingToProto in gibson, branch
+// integration/blue-team). keepAuthor makes the fake return the tags and the
+// author, as the daemon does after gibson#1574.
 type fakeFindings struct {
-	stored    []*finding.Finding
-	submitted int
-	lose      bool
+	stored     []*finding.Finding
+	submitted  int
+	lose       bool
+	keepAuthor bool
 }
 
 func (f *fakeFindings) SubmitFinding(_ context.Context, in *finding.Finding) error {
@@ -51,7 +56,13 @@ func (f *fakeFindings) SubmitFinding(_ context.Context, in *finding.Finding) err
 func (f *fakeFindings) GetFindings(context.Context, finding.Filter) ([]*finding.Finding, error) {
 	out := make([]*finding.Finding, 0, len(f.stored))
 	for _, s := range f.stored {
-		out = append(out, &finding.Finding{ID: s.ID, Title: s.Title, Description: s.Description, Severity: s.Severity})
+		cp := &finding.Finding{
+			ID: s.ID, Title: s.Title, Description: s.Description, Category: s.Category, Severity: s.Severity,
+		}
+		if f.keepAuthor {
+			cp.AgentName, cp.Tags = s.AgentName, s.Tags
+		}
+		out = append(out, cp)
 	}
 	return out, nil
 }
@@ -97,7 +108,8 @@ func TestRaise_RaisesOneFindingAndLinksIt(t *testing.T) {
 		t.Fatalf("res %+v submitted %d", res, fs.submitted)
 	}
 	f := fs.stored[0]
-	if !strings.HasPrefix(f.Title, "Incident "+cause.Ref("inc-1")+": MFA") || f.Category != cause.Category {
+	if !strings.HasPrefix(f.Title, "Incident "+cause.Ref("inc-1")+": MFA") || f.Category != cause.Category ||
+		f.AgentName != cause.AgentName {
 		t.Errorf("finding = %+v", f)
 	}
 	if f.Severity != finding.SeverityHigh {
@@ -119,14 +131,86 @@ func TestRaise_RaisesOneFindingAndLinksIt(t *testing.T) {
 	}
 }
 
-func TestRaise_AnIncidentWithACauseGetsNoSecondOne(t *testing.T) {
-	inc := oneIncident()
-	inc.Causes = []incident.Cause{{FindingID: "f-1", Status: "open"}}
-	llm := &fakeLLM{answer: goodAnswer}
+// An Incident that names the cause of this agent gets no second one.
+func TestRaise_AnIncidentWithTheCauseOfThisAgentGetsNoSecondOne(t *testing.T) {
 	fs := &fakeFindings{}
-	res, err := cause.Step{LLM: llm, Findings: fs, Linker: &fakeLinker{}}.Raise(context.Background(), inc)
-	if err != nil || !res.Existing || res.FindingID != "f-1" || llm.calls != 0 || fs.submitted != 0 {
+	llm := &fakeLLM{answer: goodAnswer}
+	step := cause.Step{LLM: llm, Findings: fs, Linker: &fakeLinker{}}
+	first, err := step.Raise(context.Background(), oneIncident())
+	if err != nil {
+		t.Fatal(err)
+	}
+	inc := oneIncident()
+	inc.Causes = []incident.Cause{{FindingID: first.FindingID, Status: "open"}}
+	llm.calls = 0
+	res, err := step.Raise(context.Background(), inc)
+	if err != nil || !res.Existing || res.FindingID != first.FindingID || llm.calls != 0 || fs.submitted != 1 {
 		t.Fatalf("res %+v err %v calls %d submitted %d", res, err, llm.calls, fs.submitted)
+	}
+}
+
+// A cause that another writer linked to the Incident is not the cause of this
+// agent. The step raises its own.
+func TestRaise_ACauseOfAnotherWriterDoesNotStopTheStep(t *testing.T) {
+	inc := oneIncident()
+	inc.Causes = []incident.Cause{{FindingID: "f-other", Status: "verified"}}
+	fs := &fakeFindings{}
+	res, err := cause.Step{LLM: &fakeLLM{answer: goodAnswer}, Findings: fs, Linker: &fakeLinker{}}.
+		Raise(context.Background(), inc)
+	if err != nil || res.Existing || res.FindingID == "f-other" || fs.submitted != 1 {
+		t.Fatalf("res %+v err %v submitted %d", res, err, fs.submitted)
+	}
+}
+
+// Another writer in the same mission raises a finding with the title prefix
+// of the incident first. A finding with another category, another author or
+// other tags is not the finding of this agent.
+func TestOwn_RefusesAFindingOfAnotherWriter(t *testing.T) {
+	prefix := cause.Prefix("inc-1")
+	mine := func() *finding.Finding {
+		return &finding.Finding{ID: "f-1", Title: prefix + "x", Category: cause.Category}
+	}
+	if !cause.Own(mine(), "inc-1") {
+		t.Fatal("the finding of this agent, as the daemon returns it today: want true")
+	}
+	withTags := mine()
+	withTags.AgentName = cause.AgentName
+	withTags.Tags = []string{cause.AgentName, "incident:" + cause.Ref("inc-1")}
+	if !cause.Own(withTags, "inc-1") {
+		t.Fatal("the finding of this agent with its author and tags: want true")
+	}
+	for name, edit := range map[string]func(*finding.Finding){
+		"other prefix":   func(f *finding.Finding) { f.Title = cause.Prefix("inc-2") + "x" },
+		"other category": func(f *finding.Finding) { f.Category = "misconfiguration" },
+		"other author":   func(f *finding.Finding) { f.AgentName = "intake-agent" },
+		"other tags":     func(f *finding.Finding) { f.Tags = []string{"incident:" + cause.Ref("inc-1")} },
+		"no id":          func(f *finding.Finding) { f.ID = " " },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := mine()
+			edit(f)
+			if cause.Own(f, "inc-1") {
+				t.Errorf("Own(%+v) = true, want false", f)
+			}
+		})
+	}
+}
+
+// The lookup takes the finding of this agent and not an earlier finding of
+// another writer with the same title prefix.
+func TestRaise_TheLookupSkipsAFindingOfAnotherWriter(t *testing.T) {
+	fs := &fakeFindings{keepAuthor: true, stored: []*finding.Finding{
+		{ID: "daemon-id-0", Title: cause.Prefix("inc-1") + "planted", Category: cause.Category, AgentName: "intake-agent"},
+		{ID: "daemon-id-00", Title: cause.Prefix("inc-1") + "planted", Category: "other"},
+	}}
+	ln := &fakeLinker{}
+	step := cause.Step{LLM: &fakeLLM{answer: goodAnswer}, Findings: fs, Linker: ln}
+	res, err := step.Raise(context.Background(), oneIncident())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Reused || res.FindingID != "daemon-id-3" || fs.submitted != 1 || ln.links[0].finding != "daemon-id-3" {
+		t.Fatalf("res %+v submitted %d links %+v, want the new finding of this agent", res, fs.submitted, ln.links)
 	}
 }
 

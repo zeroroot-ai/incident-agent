@@ -10,14 +10,18 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/a2aproject/a2a-go/v2/a2a"
+	"github.com/zeroroot-ai/incident-agent/internal/contain"
+	"github.com/zeroroot-ai/incident-agent/internal/emit"
 	"github.com/zeroroot-ai/incident-agent/internal/incident"
 	"github.com/zeroroot-ai/incident-agent/internal/pass"
+	"github.com/zeroroot-ai/incident-agent/internal/respond"
 	"github.com/zeroroot-ai/sdk/agent"
 	commonpb "github.com/zeroroot-ai/sdk/api/gen/gibson/common/v1"
 	harnesspb "github.com/zeroroot-ai/sdk/api/gen/gibson/harness/v1"
@@ -48,14 +52,46 @@ const (
 //   - GetFindings: callback_service_knowledge.go agentFindingToProto. Id,
 //     title, description, category, confidence and severity only.
 //   - Observe: the request is stored as it came.
+//   - The flight recorder: each invoke_tool call is recorded under the
+//     tool_call_id of its reply, with the tool id, the arguments and whether
+//     the connector took the action (ToolCallRecord in callback_service.go).
+//     The harness has no read of it. checker reads it, as the read of
+//     gibson would.
 type daemon struct {
 	harnesspb.UnimplementedHarnessCallbackServiceServer
 
 	mu       sync.Mutex
 	answers  map[string][]string // tool id -> "ok", "pending", "unauthorized"
 	calls    []string
+	recorded map[string]recordedCall
 	findings []*typespb.Finding
 	observed []*harnesspb.LifecycleEntityObservation
+}
+
+// recordedCall is one call in the flight recorder of the fake daemon.
+type recordedCall struct {
+	tool string
+	args string
+	ok   bool
+}
+
+// checker confirms a call from the flight recorder of the fake daemon: the id
+// must name a recorded call with the same tool and arguments that took the
+// action.
+type checker struct{ d *daemon }
+
+func (c checker) CheckCall(_ context.Context, id string, a respond.Action) error {
+	c.d.mu.Lock()
+	defer c.d.mu.Unlock()
+	args, err := json.Marshal(a.Args())
+	if err != nil {
+		return fmt.Errorf("encode the arguments: %w", err)
+	}
+	r, ok := c.d.recorded[id]
+	if !ok || !r.ok || r.tool != a.ToolID() || r.args != string(args) {
+		return fmt.Errorf("call %s: %w", id, contain.ErrNotOwnCall)
+	}
+	return nil
 }
 
 func (d *daemon) GetTaxonomySchema(
@@ -92,7 +128,14 @@ func (d *daemon) CallToolProto(
 			"invoke_tool input is not valid JSON: "+err.Error(), ""), nil
 	}
 	d.calls = append(d.calls, in.ID)
-	callID := fmt.Sprintf("call-%d", len(d.calls))
+	callID := fmt.Sprintf("0b5e2c1a-0000-4000-8000-%012d", len(d.calls))
+	if d.recorded == nil {
+		d.recorded = map[string]recordedCall{}
+	}
+	args, err := json.Marshal(in.Args)
+	if err != nil {
+		return nil, fmt.Errorf("encode the arguments: %w", err)
+	}
 	answer := "ok"
 	if list := d.answers[in.ID]; len(list) > 0 {
 		answer, d.answers[in.ID] = list[0], list[1:]
@@ -110,6 +153,7 @@ func (d *daemon) CallToolProto(
 	if !ok {
 		return metaErr(commonpb.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "no such tool "+in.ID, callID), nil
 	}
+	d.recorded[callID] = recordedCall{tool: in.ID, args: string(args), ok: true}
 	return &harnesspb.CallToolProtoResponse{OutputJson: []byte(`{"result":` + body + `}`), ToolCallId: callID}, nil
 }
 
@@ -259,10 +303,10 @@ func noResolvedClaim(t *testing.T, res agent.Result) {
 func TestRun_ContainWaitsForAPersonAndNeverRetriesARefusal(t *testing.T) {
 	d := &daemon{answers: map[string][]string{
 		"mcp:okta-response:revoke_user_sessions": {"unauthorized"},
-		"mcp:crowdstrike-response:contain_host":  {"pending", "pending"},
+		"mcp:crowdstrike-response:contain_host":  {"pending"},
 	}}
 	p := start(t, d)
-	res, err := pass.Run(context.Background(), p, reader{inc: theIncident(), d: d}, task("contain"))
+	res, err := pass.Run(context.Background(), p, reader{inc: theIncident(), d: d}, checker{d}, task("contain"))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -273,19 +317,32 @@ func TestRun_ContainWaitsForAPersonAndNeverRetriesARefusal(t *testing.T) {
 		"mcp:okta-response:suspend_user",
 		"mcp:okta-response:revoke_user_sessions",
 		"mcp:crowdstrike-response:contain_host",
-		"mcp:crowdstrike-response:contain_host",
 	}
 	if strings.Join(d.calls, ",") != strings.Join(want, ",") {
 		t.Errorf("calls =\n%v\nwant\n%v", d.calls, want)
 	}
 	props := d.properties()
-	for _, name := range []string{
-		"contained.mcp:okta-response:suspend_user." + oktaID,
-		"refused.mcp:okta-response:revoke_user_sessions." + oktaID,
-		"pending_authorization.mcp:crowdstrike-response:contain_host." + falconID,
+	okta := target(t, "Account", "okta-response", oktaID)
+	host := target(t, "Host", "crowdstrike-response", falconID)
+	for _, r := range []respond.Result{
+		{Action: respond.Action{Kind: respond.KindContain, Target: okta, Tool: "suspend_user"}, Outcome: respond.OutcomeDone},
+		{
+			Action:  respond.Action{Kind: respond.KindContain, Target: okta, Tool: "revoke_user_sessions"},
+			Outcome: respond.OutcomeRefused,
+		},
+		{
+			Action:  respond.Action{Kind: respond.KindContain, Target: host, Tool: "contain_host"},
+			Outcome: respond.OutcomePending,
+		},
 	} {
+		name := emit.RecordName(r, 1)
 		if _, ok := props[name]; !ok {
 			t.Errorf("the Incident lacks the record %s: %v", name, props)
+		}
+	}
+	for name := range props {
+		if !projectorKeyPattern.MatchString(name) {
+			t.Errorf("the projector of the daemon drops the record %q", name)
 		}
 	}
 	if res.Metadata["done"] != 1 || res.Metadata["refused"] != 1 || res.Metadata["pending"] != 1 {
@@ -301,7 +358,7 @@ func TestRun_CauseRaisesOneFindingAndLinksItWithCausedBy(t *testing.T) {
 	d := &daemon{}
 	p := start(t, d)
 	p.answer = answer
-	res, err := pass.Run(context.Background(), p, reader{inc: theIncident(), d: d}, task("cause"))
+	res, err := pass.Run(context.Background(), p, reader{inc: theIncident(), d: d}, checker{d}, task("cause"))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -334,15 +391,21 @@ func TestRun_CauseRaisesOneFindingAndLinksItWithCausedBy(t *testing.T) {
 func TestRun_ReleaseWaitsForVerifiedAndThenUndoesWhatItMade(t *testing.T) {
 	d := &daemon{}
 	p := start(t, d)
+	p.answer = answer
 	inc := theIncident()
 	r := reader{inc: inc, d: d}
-	if _, err := pass.Run(context.Background(), p, r, task("contain")); err != nil {
+	if _, err := pass.Run(context.Background(), p, r, checker{d}, task("contain")); err != nil {
 		t.Fatal(err)
 	}
+	res, err := pass.Run(context.Background(), p, r, checker{d}, task("cause"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	causeID, _ := res.Metadata["cause"].(string)
 
-	r.inc.Causes = []incident.Cause{{FindingID: "f-1", Status: "fixed"}}
+	r.inc.Causes = []incident.Cause{{FindingID: causeID, Status: "fixed"}}
 	d.calls = nil
-	res, err := pass.Run(context.Background(), p, r, task("release"))
+	res, err = pass.Run(context.Background(), p, r, checker{d}, task("release"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -351,7 +414,7 @@ func TestRun_ReleaseWaitsForVerifiedAndThenUndoesWhatItMade(t *testing.T) {
 	}
 
 	r.inc.Causes[0].Status = "verified"
-	res, err = pass.Run(context.Background(), p, r, task("release"))
+	res, err = pass.Run(context.Background(), p, r, checker{d}, task("release"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -360,6 +423,62 @@ func TestRun_ReleaseWaitsForVerifiedAndThenUndoesWhatItMade(t *testing.T) {
 		t.Errorf("calls = %v, want %s", d.calls, want)
 	}
 	noResolvedClaim(t, res)
+}
+
+// Another writer links its own verified finding as a cause and writes
+// contained records with ids of its choice. The release accepts neither.
+func TestRun_ReleaseIgnoresTheCausesAndRecordsOfAnotherWriter(t *testing.T) {
+	d := &daemon{}
+	p := start(t, d)
+	okta := target(t, "Account", "okta-response", oktaID)
+	host := target(t, "Host", "crowdstrike-response", falconID)
+	inc := theIncident()
+	inc.Causes = []incident.Cause{{FindingID: "f-planted", Status: "verified"}}
+	inc.Records = map[string]string{
+		emit.ContainedName(okta, okta.Connector.Steps[0], 1): "0b5e2c1a-0000-4000-8000-000000000001",
+		emit.ContainedName(host, host.Connector.Steps[0], 1): "0b5e2c1a-0000-4000-8000-000000000002",
+	}
+	res, err := pass.Run(context.Background(), p, plantedReader{inc: inc, d: d}, checker{d}, task("release"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(d.calls) != 0 || !strings.Contains(res.Output.(string), "no cause finding") {
+		t.Fatalf("calls %v output %q, want no call: the cause is not of this agent", d.calls, res.Output)
+	}
+
+	// The cause of this agent is verified, and the records still name no
+	// call of this agent.
+	p.answer = answer
+	if _, err := pass.Run(context.Background(), p, plantedReader{inc: inc, d: d}, checker{d}, task("cause")); err != nil {
+		t.Fatal(err)
+	}
+	inc.Causes = append(inc.Causes, incident.Cause{FindingID: d.findings[0].GetId(), Status: "verified"})
+	res, err = pass.Run(context.Background(), p, plantedReader{inc: inc, d: d}, checker{d}, task("release"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(d.calls) != 0 || strings.Count(res.Output.(string), "is not trusted") != 2 {
+		t.Fatalf("calls %v output %q, want no call and two records not trusted", d.calls, res.Output)
+	}
+}
+
+// plantedReader holds the records of another writer and the records that the
+// agent wrote.
+type plantedReader struct {
+	inc incident.Incident
+	d   *daemon
+}
+
+func (r plantedReader) Incident(context.Context, string) (incident.Incident, error) {
+	inc := r.inc
+	inc.Records = map[string]string{}
+	for k, v := range r.inc.Records {
+		inc.Records[k] = v
+	}
+	for k, v := range r.d.properties() {
+		inc.Records[k] = v
+	}
+	return inc, nil
 }
 
 func TestRun_ABadTaskContextFailsBeforeAnyCall(t *testing.T) {
@@ -372,7 +491,8 @@ func TestRun_ABadTaskContextFailsBeforeAnyCall(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			d := &daemon{}
 			p := start(t, d)
-			res, err := pass.Run(context.Background(), p, reader{inc: theIncident(), d: d}, agent.Task{ID: "t", Context: c})
+			res, err := pass.Run(context.Background(), p, reader{inc: theIncident(), d: d}, checker{d},
+				agent.Task{ID: "t", Context: c})
 			if err == nil || res.Status != a2a.TaskStateFailed {
 				t.Fatalf("res %v err %v, want a failed run", res.Status, err)
 			}
@@ -384,9 +504,23 @@ func TestRun_ABadTaskContextFailsBeforeAnyCall(t *testing.T) {
 }
 
 func TestRun_NoPlatformFails(t *testing.T) {
-	if _, err := pass.Run(context.Background(), nil, nil, task("contain")); err == nil {
+	if _, err := pass.Run(context.Background(), nil, nil, nil, task("contain")); err == nil {
 		t.Fatal("want an error")
 	}
+}
+
+// projectorKeyPattern is copied from gibson, branch integration/blue-team,
+// internal/server/daemon/graph_projector_neo4j.go: safeTaxonomyLabel. The
+// projector drops a property whose name does not match it.
+var projectorKeyPattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]*$`)
+
+func target(t *testing.T, label, connectorID, vendorID string) respond.Target {
+	t.Helper()
+	tg, err := respond.ParseTarget(incident.Place{Label: label, Key: placeKey(connectorID, vendorID)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tg
 }
 
 // placeKey is the key of a place that names a vendor id of a connector: the

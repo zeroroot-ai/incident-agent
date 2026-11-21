@@ -19,10 +19,22 @@
 //
 // # The step is safe to run again
 //
-// An Incident that names a cause already gets no second one. A finding of this
-// mission with the title prefix of the incident is the same finding, so a
-// second run after a failed link links the first finding and does not raise a
-// second one.
+// The step looks for the finding that this agent raised for the incident
+// (Finder). When the Incident names it already, the step writes nothing. When
+// the finding exists and the link failed, the step links the finding and
+// raises no second one. A cause that another writer linked to the Incident is
+// not the cause of this agent, and it does not stop the step.
+//
+// # The remaining risk of the lookup
+//
+// SubmitFinding returns no id (gibson#1574), so the step finds its finding by
+// the title prefix, the category and the tags in the findings of the mission.
+// The daemon drops the tags and the author of a finding on the way in and out
+// (protoFindingToFinding and agentFindingToProto in gibson), so today the
+// match rests on the prefix and the category. Another writer in the same
+// mission can raise a finding with the same prefix and category first. The
+// README states this risk. When SubmitFinding returns the id, the step keeps
+// that id and the lookup goes away.
 package cause
 
 import (
@@ -32,6 +44,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -48,6 +61,11 @@ const DefaultSlot = "primary"
 
 // Category is the category of a cause finding.
 const Category = "incident-cause"
+
+// AgentName is the name of this agent. It is the author of each cause
+// finding, the first tag of each cause finding, and the name that the agent
+// gives the harness.
+const AgentName = "incident-agent"
 
 // Bounds of the answer of the model.
 const (
@@ -106,8 +124,15 @@ func (s Step) Raise(ctx context.Context, inc incident.Incident) (Result, error) 
 	if s.LLM == nil || s.Findings == nil || s.Linker == nil {
 		return Result{}, errors.New("cause: the step needs a model, a finding store and a linker")
 	}
-	if len(inc.Causes) > 0 {
-		return Result{FindingID: inc.Causes[0].FindingID, Title: inc.Causes[0].Title, Existing: true}, nil
+	finder := Finder{Findings: s.Findings}
+	own, err := finder.OwnCause(ctx, inc.Key)
+	if err != nil {
+		return Result{}, err
+	}
+	if own != "" {
+		if c, ok := inc.Cause(own); ok {
+			return Result{FindingID: c.FindingID, Title: c.Title, Existing: true}, nil
+		}
 	}
 	if len(inc.Alerts) == 0 {
 		return Result{}, fmt.Errorf("cause: incident %s has no alert", inc.Key)
@@ -116,81 +141,120 @@ func (s Step) Raise(ctx context.Context, inc incident.Incident) (Result, error) 
 	if len(places) == 0 {
 		return Result{}, ErrNoPlace
 	}
-	user, err := Prompt(inc, places)
-	if err != nil {
-		return Result{}, err
+	if own != "" {
+		// An earlier run raised the finding and did not link it. The model
+		// picks the place again, so the link names the place of this run.
+		return s.relink(ctx, inc, own, places)
 	}
-	text, err := s.LLM.Complete(ctx, DefaultSlot, systemPrompt, user)
-	if err != nil {
-		return Result{}, fmt.Errorf("cause: the model call: %w", err)
-	}
-	ans, err := ParseAnswer(text, len(places))
+	ans, err := s.ask(ctx, inc, places)
 	if err != nil {
 		return Result{}, err
 	}
 	place := places[ans.Place]
 	f := s.build(inc, ans, place)
-
-	id, reused, err := s.submit(ctx, Prefix(inc.Key), f)
+	if err := s.Findings.SubmitFinding(ctx, f); err != nil {
+		return Result{}, fmt.Errorf("cause: submit the finding: %w", err)
+	}
+	id, err := finder.OwnCause(ctx, inc.Key)
 	if err != nil {
 		return Result{}, err
+	}
+	if id == "" {
+		return Result{}, errors.New(
+			"cause: the daemon stored the finding and the read of the mission findings does not hold it")
 	}
 	if err := s.Linker.LinkCause(ctx, inc.Key, id, place); err != nil {
 		return Result{}, fmt.Errorf("cause: link finding %s to incident %s: %w", id, inc.Key, err)
 	}
-	if reused {
-		// The title of this run is not the title of the finding that an
-		// earlier run raised, so the result names no title.
-		return Result{FindingID: id, Reused: true}, nil
-	}
 	return Result{FindingID: id, Title: f.Title}, nil
 }
 
-// submit raises the finding, or finds the one that an earlier run raised, and
-// returns its id.
-//
-// SubmitFinding returns no id: the daemon names the finding. So the step reads
-// the findings of this mission and takes the one whose title starts with the
-// prefix of the incident. The prefix holds a hash of the incident key, so two
-// incidents never share one. A second run finds the finding of the first run
-// by the prefix, also when the model wrote another title.
-func (s Step) submit(ctx context.Context, prefix string, f *finding.Finding) (id string, reused bool, err error) {
-	if id, err = s.byPrefix(ctx, prefix); err != nil || id != "" {
-		return id, id != "", err
-	}
-	if err = s.Findings.SubmitFinding(ctx, f); err != nil {
-		return "", false, fmt.Errorf("cause: submit the finding: %w", err)
-	}
-	id, err = s.byPrefix(ctx, prefix)
+// relink links the finding that an earlier run raised.
+func (s Step) relink(ctx context.Context, inc incident.Incident, id string, places []incident.Place) (Result, error) {
+	ans, err := s.ask(ctx, inc, places)
 	if err != nil {
-		return "", false, err
+		return Result{}, err
 	}
-	if id == "" {
-		return "", false, errors.New(
-			"cause: the daemon stored the finding and the read of the mission findings does not hold it")
+	if err := s.Linker.LinkCause(ctx, inc.Key, id, places[ans.Place]); err != nil {
+		return Result{}, fmt.Errorf("cause: link finding %s to incident %s: %w", id, inc.Key, err)
 	}
-	return id, false, nil
+	// The title of this run is not the title of the finding that an earlier
+	// run raised, so the result names no title.
+	return Result{FindingID: id, Reused: true}, nil
 }
 
-func (s Step) byPrefix(ctx context.Context, prefix string) (string, error) {
-	got, err := s.Findings.GetFindings(ctx, finding.Filter{})
+func (s Step) ask(ctx context.Context, inc incident.Incident, places []incident.Place) (Answer, error) {
+	user, err := Prompt(inc, places)
+	if err != nil {
+		return Answer{}, err
+	}
+	text, err := s.LLM.Complete(ctx, DefaultSlot, systemPrompt, user)
+	if err != nil {
+		return Answer{}, fmt.Errorf("cause: the model call: %w", err)
+	}
+	return ParseAnswer(text, len(places))
+}
+
+// Finder finds the cause finding that this agent raised for an incident. The
+// cause step uses it before it raises a finding, and the release pass uses it
+// to accept only the cause of this agent.
+type Finder struct {
+	Findings interface {
+		GetFindings(ctx context.Context, filter finding.Filter) ([]*finding.Finding, error)
+	}
+}
+
+// OwnCause returns the id of the cause finding that this agent raised for the
+// incident in this mission, or "" when there is none.
+//
+// SubmitFinding returns no id (gibson#1574): the daemon names the finding. So
+// OwnCause reads the findings of this mission and takes one that this agent
+// wrote (Own). Two matches come from two runs that raced, and the lowest id
+// is the same choice in every later run.
+func (f Finder) OwnCause(ctx context.Context, incidentKey string) (string, error) {
+	if f.Findings == nil {
+		return "", errors.New("cause: no finding store")
+	}
+	got, err := f.Findings.GetFindings(ctx, finding.Filter{})
 	if err != nil {
 		return "", fmt.Errorf("cause: read the findings of the mission: %w", err)
 	}
 	ids := make([]string, 0, 1)
-	for _, f := range got {
-		if f != nil && strings.HasPrefix(f.Title, prefix) && strings.TrimSpace(f.ID) != "" {
-			ids = append(ids, f.ID)
+	for _, fd := range got {
+		if Own(fd, incidentKey) {
+			ids = append(ids, fd.ID)
 		}
 	}
 	if len(ids) == 0 {
 		return "", nil
 	}
-	// Two findings with one prefix come from two runs that raced. The lowest id
-	// is the same choice in every later run.
 	sort.Strings(ids)
 	return ids[0], nil
 }
+
+// Own reports whether f is a cause finding that this agent wrote for the
+// incident. Each field that this agent sets must match: the title prefix and
+// the category. The daemon drops the tags and the author today. A finding
+// that carries tags must carry the two tags of this agent, and a finding that
+// carries an author must name this agent.
+func Own(f *finding.Finding, incidentKey string) bool {
+	if f == nil || strings.TrimSpace(f.ID) == "" {
+		return false
+	}
+	if !strings.HasPrefix(f.Title, Prefix(incidentKey)) || f.Category != Category {
+		return false
+	}
+	if f.AgentName != "" && f.AgentName != AgentName {
+		return false
+	}
+	if len(f.Tags) > 0 && (!slices.Contains(f.Tags, AgentName) || !slices.Contains(f.Tags, tagOf(incidentKey))) {
+		return false
+	}
+	return true
+}
+
+// tagOf is the tag that names the incident of a cause finding.
+func tagOf(incidentKey string) string { return "incident:" + Ref(incidentKey) }
 
 func (s Step) build(inc incident.Incident, ans Answer, place incident.Place) *finding.Finding {
 	lines := make([]string, 0, len(inc.Alerts))
@@ -210,7 +274,8 @@ func (s Step) build(inc incident.Incident, ans Answer, place incident.Place) *fi
 		// of the fix loop proves it (ADR-0178).
 		Confidence: 0.5,
 		Status:     finding.StatusOpen,
-		Tags:       []string{"incident-agent", "incident:" + Ref(inc.Key)},
+		AgentName:  AgentName,
+		Tags:       []string{AgentName, tagOf(inc.Key)},
 		Evidence: []finding.Evidence{{
 			Type:      finding.EvidenceLog,
 			Title:     "The alerts of the incident",

@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/zeroroot-ai/incident-agent/internal/read"
+	"github.com/zeroroot-ai/incident-agent/internal/respond"
 	"github.com/zeroroot-ai/sdk/agent"
 )
 
@@ -21,5 +22,15 @@ func TestDaemon_ReportsTheMissingReadAndNeverAnEmptyIncident(t *testing.T) {
 	}
 	if inc.Key != "" || len(inc.Alerts) != 0 {
 		t.Errorf("incident = %+v, want the zero value", inc)
+	}
+}
+
+// No read of the tool calls of an agent exists, so the check never confirms a
+// call. A record that any writer can put on the Incident node must not
+// release a containment.
+func TestDaemon_NeverConfirmsAToolCall(t *testing.T) {
+	err := read.Daemon{}.CheckCall(context.Background(), "0b5e2c1a-0000-4000-8000-000000000001", respond.Action{})
+	if !errors.Is(err, read.ErrNoToolCallRead) || !errors.Is(err, agent.ErrKnowledgeUnavailable) {
+		t.Fatalf("err = %v, want both sentinels", err)
 	}
 }

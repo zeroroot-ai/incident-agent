@@ -96,10 +96,14 @@ func TaskOf(task agent.Task) (string, error) {
 	}
 }
 
-// Run performs one task on one incident and reports what it did.
-func Run(ctx context.Context, p Platform, reader incident.Reader, task agent.Task) (agent.Result, error) {
-	if p == nil || reader == nil {
-		return failed(), errors.New("pass: no platform or no incident reader")
+// Run performs one task on one incident and reports what it did. reader
+// reads the incident, and calls confirms that a record names a tool call of
+// this agent.
+func Run(
+	ctx context.Context, p Platform, reader incident.Reader, calls contain.CallChecker, task agent.Task,
+) (agent.Result, error) {
+	if p == nil || reader == nil || calls == nil {
+		return failed(), errors.New("pass: no platform, no incident reader or no call checker")
 	}
 	key, err := IncidentKey(task)
 	if err != nil {
@@ -117,7 +121,10 @@ func Run(ctx context.Context, p Platform, reader incident.Reader, task agent.Tas
 	if err != nil {
 		return failed(), err
 	}
-	resp := contain.Pass{Reader: reader, Invoker: invoker, Recorder: emitter}
+	resp := contain.Pass{
+		Reader: reader, Invoker: invoker, Recorder: emitter, Calls: calls,
+		Causes: cause.Finder{Findings: p},
+	}
 
 	switch kind {
 	case TaskCause:
@@ -160,6 +167,8 @@ func done(kind, key string, sum contain.Summary) agent.Result {
 			"pending":  sum.Count(respond.OutcomePending),
 			"refused":  sum.Count(respond.OutcomeRefused),
 			"failed":   sum.Count(respond.OutcomeFailed),
+			"unknown":  sum.Count(respond.OutcomeUnknown),
+			"already":  len(sum.Already),
 		},
 	}
 }
@@ -170,11 +179,15 @@ func failed() agent.Result { return agent.Result{Status: a2a.TaskStateFailed} }
 // each action with its outcome. It never says that the incident is resolved.
 func Report(kind string, s contain.Summary) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "incident-agent %s: incident %s: %d calls, %d done, %d pending authorization, %d refused, %d failed",
+	fmt.Fprintf(&b, "incident-agent %s: incident %s: %d calls, %d done, %d pending authorization, "+
+		"%d refused, %d failed, %d unknown",
 		kind, s.Incident, s.Calls, s.Count(respond.OutcomeDone), s.Count(respond.OutcomePending),
-		s.Count(respond.OutcomeRefused), s.Count(respond.OutcomeFailed))
+		s.Count(respond.OutcomeRefused), s.Count(respond.OutcomeFailed), s.Count(respond.OutcomeUnknown))
 	if s.Held != "" {
 		b.WriteString("\n  released nothing: " + s.Held)
+	}
+	for _, a := range s.Already {
+		fmt.Fprintf(&b, "\n  %s %s: contained already by this agent: no call", a.ToolID(), a.Target.VendorID)
 	}
 	for _, r := range s.Results {
 		fmt.Fprintf(&b, "\n  %s %s: %s", r.Action.ToolID(), r.Action.Target.VendorID, r.Outcome)
@@ -183,6 +196,10 @@ func Report(kind string, s contain.Summary) string {
 		}
 	}
 	for _, sk := range s.Skipped {
+		if sk.Record != "" {
+			fmt.Fprintf(&b, "\n  the record %s is not trusted: %s", sk.Record, sk.Reason)
+			continue
+		}
 		fmt.Fprintf(&b, "\n  no action on %s %s: %s", respond.Clean(sk.Place.Label), respond.Clean(sk.Place.Key), sk.Reason)
 	}
 	if s.Capped {
@@ -190,6 +207,10 @@ func Report(kind string, s contain.Summary) string {
 	}
 	if s.Count(respond.OutcomePending) > 0 {
 		b.WriteString("\n  a call that waits for a person stays in the approval queue: the next dispatch calls it again")
+	}
+	if s.Count(respond.OutcomeUnknown) > 0 {
+		b.WriteString("\n  a call with the outcome unknown timed out or lost its transport: the vendor can have " +
+			"taken the action. The agent wrote no contained record for it, and the next dispatch calls it again")
 	}
 	return b.String()
 }

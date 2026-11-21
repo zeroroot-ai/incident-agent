@@ -30,6 +30,8 @@ import (
 
 	"github.com/zeroroot-ai/incident-agent/internal/incident"
 	"github.com/zeroroot-ai/sdk/agent"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
 )
@@ -131,6 +133,12 @@ const (
 	OutcomeRefused Outcome = "refused"
 	// OutcomeFailed means that the call ran and did not take the action.
 	OutcomeFailed Outcome = "failed"
+	// OutcomeUnknown means that the call timed out or its transport failed
+	// after the call left the agent. The vendor can have taken the action or
+	// not. The agent writes no contained record for it, and the next dispatch
+	// calls it again. The incident report of the daemon has no such outcome:
+	// it reads the flight recorder, which holds the error of the call.
+	OutcomeUnknown Outcome = "unknown"
 )
 
 // Result is the outcome of one action.
@@ -179,7 +187,7 @@ func (i *Invoker) Invoke(ctx context.Context, a Action) (Result, error) {
 	}
 	res := Result{Action: a, CallID: callID}
 	if err != nil {
-		res.Outcome, res.Detail = Classify(err.Error()), Clean(err.Error())
+		res.Outcome, res.Detail = Classify(err), Clean(DaemonText(err.Error()))
 		return res, nil
 	}
 	result, _ := resp.AsMap()["result"].(map[string]any)
@@ -192,12 +200,51 @@ func (i *Invoker) Invoke(ctx context.Context, a Action) (Result, error) {
 	return res, nil
 }
 
-// Classify maps the error text of a call to an outcome. The SDK gives the
-// message of the daemon and not its code, so the match is on the words of
-// the daemon (callback_metatool.go in gibson). A text that matches nothing is
-// a failure, never a success.
-func Classify(errText string) Outcome {
-	e := strings.ToLower(errText)
+// vendorMarker starts the part of an error text that the vendor wrote. The
+// connector client of the daemon puts the text of the MCP tool result after
+// it (connector_mcp.go in gibson: "connector mcp: %s on %q reported an
+// error: %s").
+const vendorMarker = " reported an error:"
+
+// DaemonText returns the part of an error text that the daemon wrote. It cuts
+// the text of the vendor, because a vendor message is untrusted data and can
+// hold any word.
+func DaemonText(errText string) string {
+	if i := strings.Index(errText, vendorMarker); i >= 0 {
+		return errText[:i] + vendorMarker + " (the vendor text is not kept)"
+	}
+	return errText
+}
+
+// Classify maps the error of a call to an outcome.
+//
+// A gRPC error is an error of the transport between the agent and the daemon.
+// Each other error holds the message of the daemon. The SDK gives that message
+// and not its code, so the match is on the words of the daemon
+// (callback_metatool.go and internal/engine/metatool in gibson). gibson#1575
+// adds typed error codes, and then this match goes away.
+//
+// The match reads only the text of the daemon. The text of the vendor never
+// decides an outcome. A text that matches nothing is a failure, never a
+// success.
+func Classify(err error) Outcome {
+	if err == nil {
+		return OutcomeDone
+	}
+	if st, ok := status.FromError(err); ok {
+		code := st.Code()
+		if code == codes.PermissionDenied || code == codes.Unauthenticated {
+			return OutcomeRefused
+		}
+		if code == codes.InvalidArgument || code == codes.NotFound || code == codes.Unimplemented ||
+			code == codes.FailedPrecondition {
+			// The daemon refused the request before it made a call.
+			return OutcomeFailed
+		}
+		// The request left the agent, and no answer came back.
+		return OutcomeUnknown
+	}
+	e := strings.ToLower(DaemonText(err.Error()))
 	switch {
 	case strings.Contains(e, "pending authorization"):
 		return OutcomePending
@@ -207,9 +254,35 @@ func Classify(errText string) Outcome {
 		strings.Contains(e, "permission"),
 		strings.Contains(e, "not active"):
 		return OutcomeRefused
+	case unknownAfterSend(e):
+		return OutcomeUnknown
 	default:
 		return OutcomeFailed
 	}
+}
+
+// unknownAfterSend reports whether the text of the daemon says that the call
+// went to the connector and no usable answer came back. Each phrase is a
+// message of the daemon or the SDK after the call was sent.
+func unknownAfterSend(e string) bool {
+	for _, phrase := range []string{
+		// connector_mcp.go: the MCP exchange with the connector failed.
+		"connector mcp: call ",
+		"connector mcp: decode the tool result",
+		"connector mcp: encode the tool result",
+		// callback_service.go: the tool ran and its answer did not encode.
+		"failed to marshal response",
+		// serve/callback_harness.go: the answer did not decode.
+		"failed to unmarshal tool output",
+		context.DeadlineExceeded.Error(),
+		"timed out",
+		"timeout",
+	} {
+		if strings.Contains(e, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 // Clean makes a text from the daemon or the graph safe to store and to show:

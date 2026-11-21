@@ -118,20 +118,18 @@ func ValidKey(raw string) (string, error) {
 	return key, nil
 }
 
-// AllVerified reports whether the incident names at least one cause and each
-// cause is verified. It returns the first cause that is not verified when the
-// answer is no.
-func (i Incident) AllVerified() (Cause, bool) {
-	if len(i.Causes) == 0 {
-		return Cause{}, false
-	}
+// Cause returns the cause with the finding id, when the Incident names it.
+func (i Incident) Cause(findingID string) (Cause, bool) {
 	for _, c := range i.Causes {
-		if strings.TrimSpace(c.Status) != StatusVerified {
-			return c, false
+		if c.FindingID == findingID {
+			return c, true
 		}
 	}
-	return Cause{}, true
+	return Cause{}, false
 }
+
+// Verified reports whether the daemon set the status verified on the cause.
+func (c Cause) Verified() bool { return strings.TrimSpace(c.Status) == StatusVerified }
 
 // HasRecord reports whether the Incident node holds a record with the name.
 func (i Incident) HasRecord(name string) bool {

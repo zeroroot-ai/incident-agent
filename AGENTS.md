@@ -11,9 +11,9 @@ One dispatch is one task on one incident. The task context names both.
 
 | Task | What the agent does | Package |
 |---|---|---|
-| `contain` | Reads the incident. Makes each containment action on each target one time: revoke the sessions of an identity, disable an account, isolate a host. | `internal/contain`, `internal/respond` |
+| `contain` | Reads the incident and its records. Skips each target that the agent contained already. Makes each other containment action one time: revoke the sessions of an identity, disable an account, isolate a host. | `internal/contain`, `internal/respond` |
 | `cause` | Raises one finding for the cause of the incident and links the Incident to it with `CAUSED_BY`. | `internal/cause` |
-| `release` | Releases each containment that the agent made, after each cause of the incident is `verified`. | `internal/contain` |
+| `release` | Releases each containment that the daemon confirms the agent made, after the cause finding that this agent raised is `verified`. | `internal/contain` |
 
 Each task writes what it did on the Incident node (`internal/emit`).
 
@@ -23,12 +23,21 @@ The agent calls the meta-tool `invoke_tool` with the canonical id `mcp:<connecto
 
 | Answer of the daemon | Outcome | What the agent does |
 |---|---|---|
-| A result that the connector confirms | `done` | Records `contained.<tool id>.<vendor id>` on the Incident. |
-| `pending authorization` | `pending_authorization` | Records it, goes on with the other actions, and calls it one more time at the end of the pass. A call that still waits stays in the approval queue for the next dispatch. |
+| A result that the connector confirms | `done` | Records `ir_contained_<key>_<generation>` on the Incident, with the `tool_call_id` of the call as its value. |
+| `pending authorization` | `pending_authorization` | Records it and goes on with the other actions. It does not call it again in the pass. The call stays in the approval queue, and the next dispatch is its retry. |
 | Not authorized, denied, blocked, run not active | `refused` | Records it. It never calls it again in the pass and does not look for a second tool with the same effect. |
+| A timeout, or a transport error after the call left the agent | `unknown` | Records it and writes no `contained` record. The vendor can have taken the action. The report says so, and the next dispatch calls it again. |
 | Any other error, or a result that does not confirm the action | `failed` | Records it. It does not call it again in the pass. |
 
-The SDK gives the message of the daemon and not its code, so `respond.Classify` matches the words of the daemon. A text that matches nothing is a failure, never a success.
+The SDK gives the message of the daemon and not its code, so `respond.Classify` matches the words of the daemon (gibson#1575 adds typed codes). It reads only the text of the daemon. The text that a vendor wrote after `reported an error:` never decides an outcome, and the report does not keep it. A text that matches nothing is a failure, never a success.
+
+## Records
+
+Each record name has the form `ir_<state>_<key>_<generation>`. The graph projector of the daemon keeps only a property name that matches `^[A-Za-z][A-Za-z0-9_]*$` and drops each other name with no error (`safeTaxonomyLabel`, `graph_projector_neo4j.go` in gibson). So the key is the first 16 hexadecimal characters of the SHA-256 of the connector id, the tool and the vendor id. A test checks each name against a copy of that pattern.
+
+A containment and its release are one generation. A containment after a release starts the next generation, so a second release can run.
+
+Any writer of the graph can write a property on the Incident node or a `CAUSED_BY` edge. So the agent trusts a `contained` record only when the daemon confirms that this agent made the call with that `tool_call_id`, that tool and that target (`contain.CallChecker`). It accepts as a cause only the finding that it raised (`cause.Own`).
 
 One pass makes at most 40 calls (`contain.MaxActions`).
 
@@ -49,7 +58,8 @@ One pass makes at most 40 calls (`contain.MaxActions`).
 Each value from the graph and from a tool result is untrusted data.
 
 - A place names its target in its key: the composite key of the identity properties `connector` and `vendor_id`, which is `connector=<id>|vendor_id=<id>`. The agent takes the connector only from the closed table. It sends the vendor id only after the id matches the form that the connector accepts. Any other key gets no action and a reason in the report.
-- A record name on the Incident is built only from the table and from a checked vendor id.
+- A record name on the Incident is built only from the table, a hash and a generation number.
+- A record value and a cause on the Incident are trusted only after the checks of the section Records.
 - The agent reads a bool or a number from a tool result, and nothing else.
 - The model of the cause step writes text and picks a place by its number in a closed list. Its answer never builds a tool id and never starts a call. An answer that fails a check is refused whole.
 
@@ -58,12 +68,14 @@ Each value from the graph and from a tool result is untrusted data.
 - It never states that an incident is resolved. The daemon sets the status of the finding of the cause, and the incident report of the daemon states what happened.
 - It never writes the status of a finding.
 - It never reads the health signal of a contained target. A containment stops its target on purpose (ADR-0180).
-- It never releases a containment that it did not record.
+- It never releases a containment that the daemon does not confirm it made.
 - It never changes a cluster. The isolation of a Kubernetes workload is a job node with a merge request in the mission, not a task of this agent.
 
 ## Seams that are not built
 
-**The incident read.** No harness call reads an incident. `internal/read` returns an error that wraps `agent.ErrKnowledgeUnavailable` for each read, so each task fails with that reason. It never returns an empty incident. The README states the call that the daemon must add.
+**The incident read.** No harness call reads an incident (gibson#1573). `internal/read` returns an error that wraps `agent.ErrKnowledgeUnavailable` for each read, so each task fails with that reason. It never returns an empty incident. The README states the call that the daemon must add.
+
+**The read of a tool call.** No harness call lets an agent read back its own tool calls. `read.Daemon.CheckCall` returns an error that wraps `agent.ErrKnowledgeUnavailable`, so a contain or release pass that finds a `contained` record fails and releases nothing. The README states the call that the daemon must add.
 
 **The tasks `triage` and `reach`.** The mission text of gibson#1478 also gives this agent the steps "join the alert to an Incident" and "record what the alert reaches". This agent does not build them. They need the incident read, and an alert of the intake agent names its target only in free text.
 

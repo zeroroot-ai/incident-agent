@@ -34,6 +34,7 @@ import (
 	"log/slog"
 	"os"
 
+	"github.com/zeroroot-ai/incident-agent/internal/cause"
 	"github.com/zeroroot-ai/incident-agent/internal/dispatch"
 	"github.com/zeroroot-ai/incident-agent/internal/pass"
 	"github.com/zeroroot-ai/incident-agent/internal/read"
@@ -95,7 +96,7 @@ func run(ctx context.Context) (agent.Result, error) {
 	}
 	defer closeHarness()
 
-	res, err := pass.Run(ctx, harness, read.Daemon{}, d.Task)
+	res, err := pass.Run(ctx, harness, read.Daemon{}, read.Daemon{}, d.Task)
 	if err != nil {
 		return res, fmt.Errorf("task %s: %w", d.Task.ID, err)
 	}
@@ -121,7 +122,7 @@ func connect(ctx context.Context, d dispatch.Dispatch) (*serve.CallbackHarness, 
 	harness := serve.NewCallbackHarness(client,
 		serve.WithCallbackMission(types.MissionContext{
 			ID:           d.MissionID,
-			CurrentAgent: "incident-agent",
+			CurrentAgent: cause.AgentName,
 		}),
 	)
 

@@ -25,18 +25,17 @@ func TestValidKey(t *testing.T) {
 	}
 }
 
-func TestAllVerified(t *testing.T) {
-	if _, ok := (incident.Incident{}).AllVerified(); ok {
-		t.Error("no cause: want false")
-	}
+func TestCause(t *testing.T) {
 	inc := incident.Incident{Causes: []incident.Cause{
 		{FindingID: "a", Status: "verified"}, {FindingID: "b", Status: "fixed"},
 	}}
-	if c, ok := inc.AllVerified(); ok || c.FindingID != "b" {
-		t.Errorf("got %+v %v, want b and false", c, ok)
+	if c, ok := inc.Cause("b"); !ok || c.Verified() {
+		t.Errorf("b: %+v %v, want found and not verified", c, ok)
 	}
-	inc.Causes[1].Status = "verified"
-	if _, ok := inc.AllVerified(); !ok {
-		t.Error("two verified causes: want true")
+	if c, ok := inc.Cause("a"); !ok || !c.Verified() {
+		t.Errorf("a: %+v %v, want found and verified", c, ok)
+	}
+	if _, ok := inc.Cause("c"); ok {
+		t.Error("c: want not found")
 	}
 }
