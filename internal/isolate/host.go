@@ -211,6 +211,9 @@ type MR struct {
 	Files      []ChangedFile
 	FilesKnown bool
 	Truncated  bool
+	// FilesError is the reason that the host gave for a list that it could
+	// not make. FilesKnown is false then.
+	FilesError string
 	// HeadSHA is the head commit of the branch. A person with push access can
 	// add a commit to the branch, so the agent compares it with the commit
 	// that it recorded when it opened the merge request.
@@ -304,8 +307,13 @@ func (h *ToolHost) State(ctx context.Context, ref string) (MR, Call, error) {
 	sha, _ := r.Result["head_sha"].(string)
 	files, known := changedFiles(r.Result["changed_files"])
 	truncated, _ := r.Result["changed_files_truncated"].(bool)
+	ferr, _ := r.Result["changed_files_error"].(string)
+	if ferr != "" {
+		// The host could not make the list. An empty list is no answer.
+		files, known = nil, false
+	}
 	return MR{State: state, SourceBranch: branch, HeadSHA: sha, Files: files, FilesKnown: known,
-		Truncated: truncated}, call, nil
+		Truncated: truncated, FilesError: ferr}, call, nil
 }
 
 // Merge implements Host. The connector merges only when the checks passed
@@ -374,6 +382,9 @@ type ChangedFile struct {
 	// BlobSHA is the git blob id of the file after the change. It is empty for
 	// a deleted file.
 	BlobSHA string
+	// Mode is the file mode after the change, for example 100644. The host can
+	// leave it empty (GitHub sends none).
+	Mode string
 }
 
 // changedFiles reads the list changed_files of merge_request_state. It returns
@@ -395,6 +406,7 @@ func changedFiles(v any) ([]ChangedFile, bool) {
 		f.Change, _ = m["change"].(string)
 		f.PreviousPath, _ = m["previous_path"].(string)
 		f.BlobSHA, _ = m["blob_sha"].(string)
+		f.Mode, _ = m["mode"].(string)
 		if f.Path == "" || f.Change == "" {
 			return nil, false
 		}

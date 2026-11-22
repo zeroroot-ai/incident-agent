@@ -34,6 +34,10 @@ const DefaultDir = "zeroroot-containment"
 // starts at 0 only by choice, so 1 is ahead of nearly each other policy.
 const ClusterPriority = 1
 
+// regularMode is the git mode of a regular file that is not executable. The
+// connector writes each file with it.
+const regularMode = "100644"
+
 // File is one file of a change to the repo of the buyer.
 type File struct {
 	Path string

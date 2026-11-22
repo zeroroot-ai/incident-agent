@@ -453,10 +453,14 @@ func (s step) read(ctx context.Context, m mrRecord, want Change) (MR, bool, erro
 // change, and the agent computes the blob id of each file that it expects.
 func filesProblem(mr MR, want Change) string {
 	switch {
+	case mr.FilesError != "":
+		return "the host could not list the changed files: " + respond.Clean(mr.FilesError)
 	case !mr.FilesKnown:
 		return "the host does not return the files that the merge request changes"
 	case mr.Truncated:
 		return "the host cut the list of changed files, so the agent cannot compare it"
+	case !shaForm.MatchString(mr.HeadSHA):
+		return "the host returned a head commit that is not 40 or 64 hexadecimal characters"
 	case len(mr.Files) != len(want.Files):
 		return fmt.Sprintf("it changes %d files and the expected change has %d", len(mr.Files), len(want.Files))
 	}
@@ -464,6 +468,9 @@ func filesProblem(mr MR, want Change) string {
 	for _, f := range mr.Files {
 		if f.Change == "renamed" || f.PreviousPath != "" {
 			return "it renames the file " + respond.Clean(f.Path)
+		}
+		if f.Change == "mode_changed" {
+			return "it changes the mode or the type of the file " + respond.Clean(f.Path)
 		}
 		got[f.Path] = f
 	}
@@ -477,6 +484,9 @@ func filesProblem(mr MR, want Change) string {
 		case !w.Delete && ((g.Change != "added" && g.Change != "modified") ||
 			g.BlobSHA != gitBlobSHA(mr.HeadSHA, w.Content)):
 			return "it changes the file " + respond.Clean(w.Path) + " to a content that the agent did not write"
+		case !w.Delete && g.Mode != "" && g.Mode != regularMode:
+			return "it writes the file " + respond.Clean(w.Path) + " with the mode " + respond.Clean(g.Mode) +
+				" and the agent wrote " + regularMode
 		}
 	}
 	return ""

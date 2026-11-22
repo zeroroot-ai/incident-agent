@@ -82,6 +82,12 @@ type gitHost struct {
 	// rename makes the first entry a rename. wide makes the repository use
 	// SHA-256 object ids.
 	truncated, rename, wide bool
+	// mode is the mode of the first written file. modeChanged makes the first
+	// entry a change of the mode. filesError makes the connector return the
+	// error and no list, as it does when the head moved.
+	mode        string
+	modeChanged bool
+	filesError  string
 
 	opened []map[string]any
 	prs    map[string]*mr
@@ -157,6 +163,10 @@ func (g *gitHost) CallToolProto(
 		result = map[string]any{"state": m.state, "source_branch": m.branch, "head_sha": m.sha, "pipeline_green": g.green}
 		if !g.noFiles {
 			result["changed_files"] = g.listFiles(m)
+			if g.filesError != "" {
+				result["changed_files"] = []any{}
+				result["changed_files_error"] = g.filesError
+			}
 			if g.truncated {
 				result["changed_files_truncated"] = true
 			}
@@ -209,9 +219,15 @@ func (g *gitHost) listFiles(m *mr) []any {
 		if f["delete"] != true {
 			content, _ := f["content"].(string)
 			entry["change"], entry["blob_sha"] = "added", g.blob(content)
+			if i == 0 && g.mode != "" {
+				entry["mode"] = g.mode
+			}
 			if _, has := g.base[path]; has {
 				entry["change"] = "modified"
 			}
+		}
+		if g.modeChanged && i == 0 {
+			entry["change"] = "mode_changed"
 		}
 		if g.rename && i == 0 {
 			entry["change"], entry["previous_path"] = "renamed", "contain/old.yaml"
@@ -963,6 +979,9 @@ func TestIsolate_MergeRequestWithAForeignChangeIsNeverMerged(t *testing.T) {
 		"no file list":       func(g *gitHost) { g.noFiles = true },
 		"a cut file list":    func(g *gitHost) { g.truncated = true },
 		"a renamed file":     func(g *gitHost) { g.rename = true },
+		"an executable file": func(g *gitHost) { g.mode = "100755" },
+		"a mode change":      func(g *gitHost) { g.modeChanged = true },
+		"a host error":       func(g *gitHost) { g.filesError = "the head moved while the files were read" },
 	}
 	for name, set := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -1077,5 +1096,25 @@ func TestIsolate_Sha256Repository(t *testing.T) {
 	sum2, err := p2.Isolate(context.Background(), incidentKey, w)
 	if err != nil || sum2.Merged || g2.count(isolate.ToolMerge) != 0 {
 		t.Fatalf("merged = %v, err = %v: %v", sum2.Merged, err, sum2.Lines)
+	}
+}
+
+// GitHub sends no mode, and the connector writes mode 100644. Both are accepted.
+func TestIsolate_AcceptsAnEmptyOrARegularMode(t *testing.T) {
+	for _, mode := range []string{"", "100644"} {
+		g, _, p := setup(t)
+		g.mode = mode
+		if sum, err := p.Isolate(context.Background(), incidentKey, workload(t)); err != nil || !sum.Merged {
+			t.Fatalf("mode %q: merged = %v, err = %v: %v", mode, sum.Merged, err, sum.Lines)
+		}
+	}
+}
+
+func TestIsolate_HostErrorIsNamedInTheReport(t *testing.T) {
+	g, _, p := setup(t)
+	g.filesError = "the head moved while the files were read"
+	sum, err := p.Isolate(context.Background(), incidentKey, workload(t))
+	if err != nil || sum.Merged || !strings.Contains(joined(sum), "the head moved while the files were read") {
+		t.Fatalf("merged = %v, err = %v: %v", sum.Merged, err, sum.Lines)
 	}
 }
