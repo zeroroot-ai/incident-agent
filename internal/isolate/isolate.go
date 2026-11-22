@@ -104,6 +104,16 @@ func generation(inc incident.Incident, key string) int {
 	}
 }
 
+// step runs the calls of one pass and keeps its summary.
+type step struct {
+	p   Pass
+	inc string
+	key string
+	gen int
+	w   Workload
+	sum *Summary
+}
+
 // mrRecord is a merge request that the agent opened: its reference and the
 // head commit that the host returned. The record value is "<ref>@<sha>". The
 // agent trusts the merge request only while its head is that commit. A
@@ -291,16 +301,6 @@ func (s step) release(ctx context.Context, isolated mrRecord, opened string) (Su
 	}
 	s.sum.Released = true
 	return *s.sum, s.write(ctx, recName(recReleased, s.key, s.gen), m.String())
-}
-
-// step runs the calls of one pass and keeps its summary.
-type step struct {
-	p   Pass
-	inc string
-	key string
-	gen int
-	w   Workload
-	sum *Summary
 }
 
 // isolationRef returns the merge request of the isolation that the release

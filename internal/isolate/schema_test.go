@@ -31,7 +31,7 @@ type schemaSet struct {
 
 func load(t *testing.T, file string) map[string]any {
 	t.Helper()
-	raw, err := os.ReadFile("testdata/" + file)
+	raw, err := os.ReadFile("testdata/" + file) //nolint:gosec // the name is a constant of this test
 	if err != nil {
 		t.Fatalf("read %s: %v", file, err)
 	}
@@ -46,7 +46,7 @@ func asMap(v any) map[string]any { m, _ := v.(map[string]any); return m }
 
 // crdSchema returns the schema of one version of a CRD, and checks the group,
 // the kind and the scope against the document.
-func crdSchema(t *testing.T, crd map[string]any, doc map[string]any) map[string]any {
+func crdSchema(t *testing.T, crd, doc map[string]any) map[string]any {
 	t.Helper()
 	spec := asMap(crd["spec"])
 	apiVersion, _ := doc["apiVersion"].(string)
@@ -108,18 +108,7 @@ func (s schemaSet) validate(v any, n map[string]any, path string) []string {
 	n = s.resolve(n)
 	var errs []string
 	fail := func(f string, a ...any) { errs = append(errs, path+": "+fmt.Sprintf(f, a...)) }
-	for _, sub := range listOf(n["allOf"]) {
-		errs = append(errs, s.validate(v, asMap(sub), path)...)
-	}
-	if subs := listOf(n["anyOf"]); len(subs) > 0 && countValid(s, v, subs, path) == 0 {
-		fail("matches none of anyOf")
-	}
-	if subs := listOf(n["oneOf"]); len(subs) > 0 && countValid(s, v, subs, path) != 1 {
-		fail("does not match exactly one of oneOf")
-	}
-	if enum := listOf(n["enum"]); len(enum) > 0 && !contains(enum, v) {
-		fail("%v is not in %v", v, enum)
-	}
+	errs = append(errs, s.combine(v, n, path)...)
 	if n["x-kubernetes-int-or-string"] == true {
 		return errs
 	}
@@ -135,20 +124,46 @@ func (s schemaSet) validate(v any, n map[string]any, path string) []string {
 	case "string":
 		errs = append(errs, str(v, n, path)...)
 	case "integer", "number":
-		x, ok := num(v)
-		if !ok || (n["type"] == "integer" && !isInt(v)) {
-			fail("%v is not a %v", v, n["type"])
-		} else if lim, has := num(n["minimum"]); has && x < lim {
-			fail("%v is below the minimum %v", x, lim)
-		} else if lim, has := num(n["maximum"]); has && x > lim {
-			fail("%v is above the maximum %v", x, lim)
-		}
+		errs = append(errs, number(v, n, path)...)
 	case "boolean":
 		if _, ok := v.(bool); !ok {
 			fail("%v is not a boolean", v)
 		}
 	}
 	return errs
+}
+
+// combine checks allOf, anyOf, oneOf and enum.
+func (s schemaSet) combine(v any, n map[string]any, path string) []string {
+	var errs []string
+	fail := func(f string, a ...any) { errs = append(errs, path+": "+fmt.Sprintf(f, a...)) }
+	for _, sub := range listOf(n["allOf"]) {
+		errs = append(errs, s.validate(v, asMap(sub), path)...)
+	}
+	if subs := listOf(n["anyOf"]); len(subs) > 0 && countValid(s, v, subs, path) == 0 {
+		fail("matches none of anyOf")
+	}
+	if subs := listOf(n["oneOf"]); len(subs) > 0 && countValid(s, v, subs, path) != 1 {
+		fail("does not match exactly one of oneOf")
+	}
+	if enum := listOf(n["enum"]); len(enum) > 0 && !contains(enum, v) {
+		fail("%v is not in %v", v, enum)
+	}
+	return errs
+}
+
+func number(v any, n map[string]any, path string) []string {
+	x, ok := num(v)
+	switch lo, hasLo := num(n["minimum"]); {
+	case !ok || (n["type"] == "integer" && !isInt(v)):
+		return []string{fmt.Sprintf("%s: %v is not a %v", path, v, n["type"])}
+	case hasLo && x < lo:
+		return []string{fmt.Sprintf("%s: %v is below the minimum %v", path, x, lo)}
+	}
+	if hi, has := num(n["maximum"]); has && x > hi {
+		return []string{fmt.Sprintf("%s: %v is above the maximum %v", path, x, hi)}
+	}
+	return nil
 }
 
 func (s schemaSet) object(v any, n map[string]any, path string, strict bool) []string {
@@ -251,16 +266,16 @@ func countValid(s schemaSet, v any, subs []any, path string) int {
 
 // schemaOf returns the schema that the policy kind of the repo is validated
 // against, and the document.
-func schemaOf(t *testing.T, kind string) (schemaSet, map[string]any, map[string]any) {
+func schemaOf(t *testing.T, kind string) (set schemaSet, schema, doc map[string]any) {
 	t.Helper()
-	doc := parse(t, repoOf(kind).Isolate(incidentKey, workload(t), 1).Files[0].Content)
+	doc = parse(t, repoOf(kind).Isolate(incidentKey, workload(t), 1).Files[0].Content)
 	switch kind {
 	case isolate.KindCilium:
 		return schemaSet{}, crdSchema(t, load(t, "ciliumnetworkpolicies.v1.19.11.yaml"), doc), doc
 	case isolate.KindCluster:
 		return schemaSet{}, crdSchema(t, load(t, "clusternetworkpolicies.v0.3.1.yaml"), doc), doc
 	default:
-		set := schemaSet{root: load(t, "networkpolicy.v1.36.6.schema.json")}
+		set = schemaSet{root: load(t, "networkpolicy.v1.36.6.schema.json")}
 		if doc["apiVersion"] != "networking.k8s.io/v1" || doc["kind"] != "NetworkPolicy" {
 			t.Fatalf("the document is %v %v", doc["apiVersion"], doc["kind"])
 		}
@@ -308,7 +323,7 @@ func TestClusterPolicyNetworksAreMaskedCIDRs(t *testing.T) {
 func TestSchemaValidatorRejectsABrokenPolicy(t *testing.T) {
 	cases := map[string]struct {
 		kind   string
-		break_ func(doc map[string]any)
+		mutate func(doc map[string]any)
 	}{
 		"an unknown tier": {isolate.KindCluster, func(d map[string]any) {
 			at(t, d, "spec").(map[string]any)["tier"] = "Bogus"
@@ -336,7 +351,7 @@ func TestSchemaValidatorRejectsABrokenPolicy(t *testing.T) {
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
 			set, schema, doc := schemaOf(t, tc.kind)
-			tc.break_(doc)
+			tc.mutate(doc)
 			if errs := set.validate(doc, schema, tc.kind); len(errs) == 0 {
 				t.Fatalf("the validator accepted a broken policy")
 			}

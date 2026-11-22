@@ -128,33 +128,7 @@ func (g *gitHost) CallToolProto(
 		g.prs[ref] = m
 		result = map[string]any{"merge_request": ref, "head_sha": g.prs[ref].sha}
 	case isolate.ToolMerge:
-		m, known := g.prs[ref]
-		switch {
-		case !known:
-			return errors.New("connector mcp: merge_merge_request on \"x\" reported an error: not found")
-		case m.state == "merged":
-			return errors.New("connector mcp: merge_merge_request on \"x\" reported an error: HTTP 405 already merged")
-		}
-		if g.beforeMerge != nil {
-			g.beforeMerge(ref)
-		}
-		// GitHub refuses the merge with HTTP 409 when the head is not the sha
-		// of the call. The connector then returns merged false.
-		if expected, _ := args["sha"].(string); expected != m.sha {
-			return g.answer(response, map[string]any{"state": m.state, "merged": false})
-		}
-		if g.green {
-			m.state = "merged"
-			for _, f := range m.files {
-				p, _ := f["path"].(string)
-				if f["delete"] == true {
-					delete(g.base, p)
-				} else {
-					g.base[p], _ = f["content"].(string)
-				}
-			}
-		}
-		result = map[string]any{"state": m.state, "merged": m.state == "merged"}
+		return g.merge(response, ref, args)
 	case isolate.ToolState:
 		m, known := g.prs[ref]
 		if !known {
@@ -178,6 +152,37 @@ func (g *gitHost) CallToolProto(
 		g.t.Fatalf("the agent called %s: an isolation never reads a health signal or reverts", id)
 	}
 	return g.answer(response, result)
+}
+
+// merge answers merge_merge_request.
+func (g *gitHost) merge(response proto.Message, ref string, args map[string]any) error {
+	m, known := g.prs[ref]
+	switch {
+	case !known:
+		return errors.New("connector mcp: merge_merge_request on \"x\" reported an error: not found")
+	case m.state == "merged":
+		return errors.New("connector mcp: merge_merge_request on \"x\" reported an error: HTTP 405 already merged")
+	}
+	if g.beforeMerge != nil {
+		g.beforeMerge(ref)
+	}
+	// GitHub refuses the merge with HTTP 409 when the head is not the sha of
+	// the call. The connector then returns merged false.
+	if expected, _ := args["sha"].(string); expected != m.sha {
+		return g.answer(response, map[string]any{"state": m.state, "merged": false})
+	}
+	if g.green {
+		m.state = "merged"
+		for _, f := range m.files {
+			p, _ := f["path"].(string)
+			if f["delete"] == true {
+				delete(g.base, p)
+			} else {
+				g.base[p], _ = f["content"].(string)
+			}
+		}
+	}
+	return g.answer(response, map[string]any{"state": m.state, "merged": m.state == "merged"})
 }
 
 func (g *gitHost) answer(response proto.Message, result map[string]any) error {
