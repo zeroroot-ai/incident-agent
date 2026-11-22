@@ -120,7 +120,7 @@ func (p Pass) Isolate(ctx context.Context, key string, w Workload) (Summary, err
 	run := step{p: p, inc: key, key: ck, gen: gen, sum: &sum}
 
 	if done := inc.Records[recName(recIsolated, ck, gen)]; done != "" {
-		merged, err := run.verify(ctx, done, IsolateBranch(ck, gen))
+		merged, err := run.verify(ctx, done, IsolationBranch(ck, gen))
 		if err != nil || !merged {
 			return sum, err
 		}
@@ -151,7 +151,7 @@ func (p Pass) Isolate(ctx context.Context, key string, w Workload) (Summary, err
 			return sum, err
 		}
 	}
-	merged, err := run.drive(ctx, ref, IsolateBranch(ck, gen))
+	merged, err := run.drive(ctx, ref, IsolationBranch(ck, gen))
 	if err != nil || !merged {
 		return sum, err
 	}
@@ -197,19 +197,11 @@ func (p Pass) Release(ctx context.Context, key string, w Workload) (Summary, err
 	}
 	gen := generation(inc, ck)
 	run := step{p: p, inc: key, key: ck, gen: gen, sum: &sum}
-	isolated := inc.Records[recName(recIsolated, ck, gen)]
-	opened := inc.Records[recName(recIsolationOpened, ck, gen)]
-	switch {
-	case isolated == "" && opened == "":
-		run.say("this agent holds no isolation of the workload to release")
-		return sum, nil
-	case isolated == "":
-		var cont bool
-		if isolated, cont, err = run.settleOpen(ctx, opened, IsolateBranch(ck, gen)); err != nil || !cont {
-			return sum, err
-		}
+	isolated, cont, err := run.isolationRef(ctx, inc)
+	if err != nil || !cont {
+		return sum, err
 	}
-	merged, err := run.verify(ctx, isolated, IsolateBranch(ck, gen))
+	merged, err := run.verify(ctx, isolated, IsolationBranch(ck, gen))
 	if err != nil || !merged {
 		return sum, err
 	}
@@ -239,12 +231,46 @@ func (p Pass) Release(ctx context.Context, key string, w Workload) (Summary, err
 	return sum, run.write(ctx, recName(recReleased, ck, gen), ref)
 }
 
+// step runs the calls of one pass and keeps its summary.
+type step struct {
+	p   Pass
+	inc string
+	key string
+	gen int
+	sum *Summary
+}
+
+func (s step) say(line string) { s.sum.Lines = append(s.sum.Lines, line) }
+
+func (s step) write(ctx context.Context, name, value string) error {
+	if err := s.p.Recorder.RecordValue(ctx, s.inc, name, value); err != nil {
+		return fmt.Errorf("isolate: record %s: %w", name, err)
+	}
+	return nil
+}
+
+// isolationRef returns the merge request of the isolation that the release
+// works on, and whether the release goes on.
+func (s step) isolationRef(ctx context.Context, inc incident.Incident) (string, bool, error) {
+	isolated := inc.Records[recName(recIsolated, s.key, s.gen)]
+	opened := inc.Records[recName(recIsolationOpened, s.key, s.gen)]
+	switch {
+	case isolated == "" && opened == "":
+		s.say("this agent holds no isolation of the workload to release")
+		return "", false, nil
+	case isolated == "":
+		return s.settleOpen(ctx, opened, IsolationBranch(s.key, s.gen))
+	default:
+		return isolated, true, nil
+	}
+}
+
 // settleOpen handles an isolation merge request that the agent opened and did
 // not record as merged. A merge request that is still open is closed, so
 // nobody merges it after the release. A merge request that merged is
 // recorded, and the release goes on with it. It returns the merged reference
 // and whether the release goes on.
-func (s step) settleOpen(ctx context.Context, ref, branch string) (string, bool, error) {
+func (s step) settleOpen(ctx context.Context, ref, branch string) (merged string, cont bool, err error) {
 	mr, ok, err := s.read(ctx, ref, branch)
 	if err != nil || !ok {
 		return "", false, err
@@ -269,24 +295,6 @@ func (s step) settleOpen(ctx context.Context, ref, branch string) (string, bool,
 			" and not merged")
 	}
 	return "", false, s.write(ctx, recName(recReleased, s.key, s.gen), ref)
-}
-
-// step runs the calls of one pass and keeps its summary.
-type step struct {
-	p   Pass
-	inc string
-	key string
-	gen int
-	sum *Summary
-}
-
-func (s step) say(line string) { s.sum.Lines = append(s.sum.Lines, line) }
-
-func (s step) write(ctx context.Context, name, value string) error {
-	if err := s.p.Recorder.RecordValue(ctx, s.inc, name, value); err != nil {
-		return fmt.Errorf("isolate: record %s: %w", name, err)
-	}
-	return nil
 }
 
 // outcome counts the call. It returns true, and says why, when the call did

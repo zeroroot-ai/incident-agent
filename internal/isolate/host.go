@@ -296,7 +296,7 @@ func (h *ToolHost) Close(ctx context.Context, ref string) (Call, error) {
 
 // ReadFile implements Host. It reads the base branch. A result that does not
 // say whether the file exists is a failure, never "found".
-func (h *ToolHost) ReadFile(ctx context.Context, path string) (string, bool, Call, error) {
+func (h *ToolHost) ReadFile(ctx context.Context, path string) (content string, found bool, call Call, err error) {
 	r, call, err := h.call(ctx, ToolReadFile, map[string]any{
 		"project": h.repo.Project, "ref": h.repo.BaseBranch, "path": path,
 	})
@@ -307,6 +307,6 @@ func (h *ToolHost) ReadFile(ctx context.Context, path string) (string, bool, Cal
 	if !ok {
 		return "", false, Call{Outcome: respond.OutcomeFailed, Detail: "the result does not say if the file exists"}, nil
 	}
-	content, _ := r.Result["content"].(string)
+	content, _ = r.Result["content"].(string)
 	return content, found, call, nil
 }

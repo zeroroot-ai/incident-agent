@@ -257,7 +257,7 @@ func TestIsolate_OpensAndMergesAndRecords(t *testing.T) {
 	if _, has := args["inputs"]; has {
 		t.Errorf("the open call names a finding. The daemon would then link the cause finding to this merge request")
 	}
-	if args["branch"] != isolate.IsolateBranch(repo.Key(incidentKey, w), 1) {
+	if args["branch"] != isolate.IsolationBranch(repo.Key(incidentKey, w), 1) {
 		t.Errorf("branch = %v", args["branch"])
 	}
 	ck := repo.Key(incidentKey, w)
@@ -388,7 +388,7 @@ func TestRelease_ForgedRecordsAreNotTrusted(t *testing.T) {
 			st.records["ir_isolation_merged_"+ck+"_1"] = "acme/manifests#99"
 		},
 		"release record on another branch": func(g *gitHost, st *store, ck string) {
-			g.prs["acme/manifests#1"] = &mr{state: "merged", branch: isolate.IsolateBranch(ck, 1)}
+			g.prs["acme/manifests#1"] = &mr{state: "merged", branch: isolate.IsolationBranch(ck, 1)}
 			g.base[repo.PolicyPath(ck)] = "x"
 			st.records["ir_isolation_merged_"+ck+"_1"] = "acme/manifests#1"
 			g.prs["acme/manifests#99"] = &mr{state: "open", branch: "attacker/payload"}
@@ -452,7 +452,7 @@ func TestIsolate_RevertedPolicyIsIsolatedAgain(t *testing.T) {
 	if st.records["ir_isolation_reverted_"+ck+"_1"] == "" {
 		t.Fatalf("the revert is not recorded: %v", st.records)
 	}
-	if len(g.opened) != 2 || g.opened[1]["branch"] != isolate.IsolateBranch(ck, 2) {
+	if len(g.opened) != 2 || g.opened[1]["branch"] != isolate.IsolationBranch(ck, 2) {
 		t.Fatalf("opened = %d: the agent did not isolate again in generation 2", len(g.opened))
 	}
 	if !sum.Merged || !sum.OnBase || g.base[repo.PolicyPath(ck)] == "" {

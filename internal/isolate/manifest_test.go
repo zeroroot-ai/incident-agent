@@ -48,15 +48,18 @@ func selector(t *testing.T, m map[string]any, path ...string) map[string]any {
 
 func TestPolicyYAML(t *testing.T) {
 	w := workload(t)
-	for _, kind := range []string{isolate.KindCilium, isolate.KindAdmin, isolate.KindNetworkPolicy} {
+	checks := map[string]func(*testing.T, map[string]any, string) map[string]any{
+		isolate.KindCilium:        checkCilium,
+		isolate.KindAdmin:         checkAdmin,
+		isolate.KindNetworkPolicy: checkNetworkPolicy,
+	}
+	for kind, check := range checks {
 		t.Run(kind, func(t *testing.T) {
-			r := repoOf(kind)
-			c := r.Isolate(incidentKey, w, 1)
+			c := repoOf(kind).Isolate(incidentKey, w, 1)
 			if len(c.Files) != 2 {
 				t.Fatalf("the change has %d files, want the policy and the lock", len(c.Files))
 			}
-			policy := parse(t, c.Files[0].Content)
-			lock := parse(t, c.Files[1].Content)
+			policy, lock := parse(t, c.Files[0].Content), parse(t, c.Files[1].Content)
 			if lock["state"] != "open" || lock["policy"] != c.Files[0].Path || lock["kind"] != kind {
 				t.Errorf("the lock = %v", lock)
 			}
@@ -66,66 +69,69 @@ func TestPolicyYAML(t *testing.T) {
 			if strings.Contains(c.Files[0].Content+c.Files[1].Content, incidentKey) {
 				t.Errorf("a file holds the incident key. It must hold only the hash")
 			}
-			want := map[string]any{"app": "ledger", "tier": "api"}
-			var got map[string]any
-			switch kind {
-			case isolate.KindCilium:
-				if at(t, policy, "kind") != "CiliumNetworkPolicy" || at(t, policy, "metadata", "namespace") != "payments" {
-					t.Errorf("policy = %v", policy)
-				}
-				got = selector(t, policy, "spec", "endpointSelector", "matchLabels")
-				if fmt.Sprint(at(t, policy, "spec", "ingressDeny")) != "[map[fromEntities:[all]]]" ||
-					fmt.Sprint(at(t, policy, "spec", "egressDeny")) != "[map[toEntities:[all]]]" {
-					t.Errorf("the deny rules are not deny all: %v", policy["spec"])
-				}
-				if _, has := at(t, policy, "spec").(map[string]any)["egress"]; has {
-					t.Errorf("the policy has an allow list")
-				}
-			case isolate.KindAdmin:
-				if at(t, policy, "kind") != "AdminNetworkPolicy" {
-					t.Errorf("policy = %v", policy)
-				}
-				if _, has := at(t, policy, "metadata").(map[string]any)["namespace"]; has {
-					t.Errorf("an AdminNetworkPolicy is cluster scoped")
-				}
-				if at(t, policy, "spec", "priority") != isolate.AdminPriority {
-					t.Errorf("priority = %v", at(t, policy, "spec", "priority"))
-				}
-				got = selector(t, policy, "spec", "subject", "pods", "podSelector", "matchLabels")
-				ns := selector(t, policy, "spec", "subject", "pods", "namespaceSelector", "matchLabels")
-				if ns["kubernetes.io/metadata.name"] != "payments" {
-					t.Errorf("the namespace selector = %v", ns)
-				}
-				for _, dir := range []string{"ingress", "egress"} {
-					rules, _ := at(t, policy, "spec", dir).([]any)
-					if len(rules) != 1 || rules[0].(map[string]any)["action"] != "Deny" { //nolint:forcetypeassert // test
-						t.Errorf("%s rules = %v, want one Deny", dir, rules)
-					}
-				}
-				if !strings.Contains(c.Files[0].Content, "0.0.0.0/0") || !strings.Contains(c.Files[0].Content, `"::/0"`) {
-					t.Errorf("the egress deny does not cover the networks outside the cluster")
-				}
-			default:
-				if at(t, policy, "kind") != "NetworkPolicy" || at(t, policy, "metadata", "namespace") != "payments" {
-					t.Errorf("policy = %v", policy)
-				}
-				got = selector(t, policy, "spec", "podSelector", "matchLabels")
-				types := fmt.Sprint(at(t, policy, "spec", "policyTypes"))
-				spec, _ := at(t, policy, "spec").(map[string]any)
-				_, ingress := spec["ingress"]
-				_, egress := spec["egress"]
-				if types != "[Ingress Egress]" || ingress || egress {
-					t.Errorf("policyTypes = %s, ingress rules = %v, egress rules = %v", types, ingress, egress)
-				}
-			}
-			if fmt.Sprint(got) != fmt.Sprint(want) {
-				t.Errorf("the selector = %v, want %v", got, want)
+			got := check(t, policy, c.Files[0].Content)
+			if fmt.Sprint(got) != fmt.Sprint(map[string]any{"app": "ledger", "tier": "api"}) {
+				t.Errorf("the selector = %v", got)
 			}
 			if at(t, policy, "metadata", "annotations", isolate.AnnotationRule) == "" {
 				t.Errorf("no rule against a revert")
 			}
 		})
 	}
+}
+
+func checkCilium(t *testing.T, policy map[string]any, _ string) map[string]any {
+	t.Helper()
+	if at(t, policy, "kind") != "CiliumNetworkPolicy" || at(t, policy, "metadata", "namespace") != "payments" {
+		t.Errorf("policy = %v", policy)
+	}
+	if fmt.Sprint(at(t, policy, "spec", "ingressDeny")) != "[map[fromEntities:[all]]]" ||
+		fmt.Sprint(at(t, policy, "spec", "egressDeny")) != "[map[toEntities:[all]]]" {
+		t.Errorf("the deny rules are not deny all: %v", policy["spec"])
+	}
+	return selector(t, policy, "spec", "endpointSelector", "matchLabels")
+}
+
+func checkAdmin(t *testing.T, policy map[string]any, text string) map[string]any {
+	t.Helper()
+	if at(t, policy, "kind") != "AdminNetworkPolicy" {
+		t.Errorf("policy = %v", policy)
+	}
+	if _, has := at(t, policy, "metadata").(map[string]any)["namespace"]; has {
+		t.Errorf("an AdminNetworkPolicy is cluster scoped")
+	}
+	if at(t, policy, "spec", "priority") != isolate.AdminPriority {
+		t.Errorf("priority = %v", at(t, policy, "spec", "priority"))
+	}
+	ns := selector(t, policy, "spec", "subject", "pods", "namespaceSelector", "matchLabels")
+	if ns["kubernetes.io/metadata.name"] != "payments" {
+		t.Errorf("the namespace selector = %v", ns)
+	}
+	for _, dir := range []string{"ingress", "egress"} {
+		rules, _ := at(t, policy, "spec", dir).([]any)
+		first, _ := rules[0].(map[string]any)
+		if len(rules) != 1 || first["action"] != "Deny" {
+			t.Errorf("%s rules = %v, want one Deny", dir, rules)
+		}
+	}
+	if !strings.Contains(text, "0.0.0.0/0") || !strings.Contains(text, `"::/0"`) {
+		t.Errorf("the egress deny does not cover the networks outside the cluster")
+	}
+	return selector(t, policy, "spec", "subject", "pods", "podSelector", "matchLabels")
+}
+
+func checkNetworkPolicy(t *testing.T, policy map[string]any, _ string) map[string]any {
+	t.Helper()
+	if at(t, policy, "kind") != "NetworkPolicy" || at(t, policy, "metadata", "namespace") != "payments" {
+		t.Errorf("policy = %v", policy)
+	}
+	spec, _ := at(t, policy, "spec").(map[string]any)
+	_, ingress := spec["ingress"]
+	_, egress := spec["egress"]
+	if types := fmt.Sprint(at(t, policy, "spec", "policyTypes")); types != "[Ingress Egress]" || ingress || egress {
+		t.Errorf("policyTypes = %s, ingress rules = %v, egress rules = %v", types, ingress, egress)
+	}
+	return selector(t, policy, "spec", "podSelector", "matchLabels")
 }
 
 func TestParseWorkload(t *testing.T) {

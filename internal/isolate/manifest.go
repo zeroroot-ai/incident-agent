@@ -70,8 +70,8 @@ func (r Repo) Key(incidentKey string, w Workload) string {
 // PolicyName is the name of the policy of one containment.
 func PolicyName(key string) string { return "zeroroot-isolate-" + key }
 
-// IsolateBranch is the branch of the isolation merge request of a generation.
-func IsolateBranch(key string, gen int) string {
+// IsolationBranch is the branch of the isolation merge request of a generation.
+func IsolationBranch(key string, gen int) string {
 	return "zeroroot/isolate-" + key + "-" + strconv.Itoa(gen)
 }
 
@@ -101,7 +101,7 @@ func (r Repo) Isolate(incidentKey string, w Workload, gen int) Change {
 	key := r.Key(incidentKey, w)
 	ref := cause.Ref(incidentKey)
 	return Change{
-		Branch: IsolateBranch(key, gen),
+		Branch: IsolationBranch(key, gen),
 		Title:  "contain(incident-" + ref + "): isolate a workload",
 		Description: "The incident agent isolates one workload of the incident " + ref + ".\n" +
 			"The policy denies all ingress and all egress for the pods with the labels below.\n" +
