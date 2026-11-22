@@ -251,7 +251,7 @@ func (s step) write(ctx context.Context, name, value string) error {
 
 // isolationRef returns the merge request of the isolation that the release
 // works on, and whether the release goes on.
-func (s step) isolationRef(ctx context.Context, inc incident.Incident) (string, bool, error) {
+func (s step) isolationRef(ctx context.Context, inc incident.Incident) (ref string, cont bool, err error) {
 	isolated := inc.Records[recName(recIsolated, s.key, s.gen)]
 	opened := inc.Records[recName(recIsolationOpened, s.key, s.gen)]
 	switch {
