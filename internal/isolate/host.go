@@ -5,9 +5,13 @@ package isolate
 
 import (
 	"context"
+	"crypto/sha1" //nolint:gosec // git object ids are SHA-1 in a SHA-1 repository
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -201,10 +205,12 @@ type MR struct {
 	// SourceBranch is the branch of the merge request. The connector omits
 	// it for a merge request from a fork.
 	SourceBranch string
-	// Files are the files that the merge request changes. FilesKnown is
-	// false when the host returned no list.
-	Files      []File
+	// Files are the files that the merge request changes, as the host lists
+	// them. FilesKnown is false when the host returned no list. Truncated is
+	// true when the host cut the list.
+	Files      []ChangedFile
 	FilesKnown bool
+	Truncated  bool
 	// HeadSHA is the head commit of the branch. A person with push access can
 	// add a commit to the branch, so the agent compares it with the commit
 	// that it recorded when it opened the merge request.
@@ -297,7 +303,9 @@ func (h *ToolHost) State(ctx context.Context, ref string) (MR, Call, error) {
 	branch, _ := r.Result["source_branch"].(string)
 	sha, _ := r.Result["head_sha"].(string)
 	files, known := changedFiles(r.Result["changed_files"])
-	return MR{State: state, SourceBranch: branch, HeadSHA: sha, Files: files, FilesKnown: known}, call, nil
+	truncated, _ := r.Result["changed_files_truncated"].(bool)
+	return MR{State: state, SourceBranch: branch, HeadSHA: sha, Files: files, FilesKnown: known,
+		Truncated: truncated}, call, nil
 }
 
 // Merge implements Host. The connector merges only when the checks passed
@@ -354,28 +362,56 @@ func bypassNote(kind string) string {
 	}
 }
 
-// changedFiles reads the list changed_files of merge_request_state. Each entry
-// has a path, and either content or delete true. It returns false for a result
-// that has no list or a malformed entry. A malformed list never reads as an
-// empty change.
-func changedFiles(v any) ([]File, bool) {
+// ChangedFile is one entry of the list that merge_request_state returns for
+// the files that a merge request changes. The list holds no content. It holds
+// the git blob id of each file after the change.
+type ChangedFile struct {
+	Path string
+	// Change is added, modified, deleted or renamed.
+	Change string
+	// PreviousPath is set for a renamed file.
+	PreviousPath string
+	// BlobSHA is the git blob id of the file after the change. It is empty for
+	// a deleted file.
+	BlobSHA string
+}
+
+// changedFiles reads the list changed_files of merge_request_state. It returns
+// false for a result that has no list, or a malformed entry. A malformed list
+// never reads as an empty change.
+func changedFiles(v any) ([]ChangedFile, bool) {
 	list, ok := v.([]any)
 	if !ok {
 		return nil, false
 	}
-	out := make([]File, 0, len(list))
+	out := make([]ChangedFile, 0, len(list))
 	for _, e := range list {
 		m, ok := e.(map[string]any)
 		if !ok {
 			return nil, false
 		}
-		path, _ := m["path"].(string)
-		if path == "" {
+		f := ChangedFile{}
+		f.Path, _ = m["path"].(string)
+		f.Change, _ = m["change"].(string)
+		f.PreviousPath, _ = m["previous_path"].(string)
+		f.BlobSHA, _ = m["blob_sha"].(string)
+		if f.Path == "" || f.Change == "" {
 			return nil, false
 		}
-		del, _ := m["delete"].(bool)
-		content, _ := m["content"].(string)
-		out = append(out, File{Path: path, Content: content, Delete: del})
+		out = append(out, f)
 	}
 	return out, true
+}
+
+// gitBlobSHA is the git object id of a file: the hash of "blob <length>", a
+// zero byte and the content. The hash is SHA-256 when the head commit has 64
+// hexadecimal characters, and SHA-1 when it has 40.
+func gitBlobSHA(headSHA, content string) string {
+	header := "blob " + strconv.Itoa(len(content)) + "\x00"
+	if len(headSHA) == 64 {
+		sum := sha256.Sum256([]byte(header + content))
+		return hex.EncodeToString(sum[:])
+	}
+	sum := sha1.Sum([]byte(header + content)) //nolint:gosec // git object ids are SHA-1 in a SHA-1 repository
+	return hex.EncodeToString(sum[:])
 }

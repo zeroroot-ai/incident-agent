@@ -5,8 +5,11 @@ package pass_test
 
 import (
 	"context"
+	"crypto/sha1" //nolint:gosec // git object ids are SHA-1 in a SHA-1 repository
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -43,7 +46,7 @@ func (g *gitPlatform) CallToolProto(
 	switch id {
 	case "mcp:gitlab-fixloop:open_merge_request":
 		g.branch, _ = args["branch"].(string)
-		g.changed, _ = args["files"].([]any)
+		g.changed = listed(args["files"])
 		for _, f := range args["files"].([]any) { //nolint:forcetypeassert // the test controls the args
 			m := f.(map[string]any)                                //nolint:forcetypeassert // the test controls the args
 			g.files[m["path"].(string)], _ = m["content"].(string) //nolint:forcetypeassert // the test controls the args
@@ -88,6 +91,20 @@ func (g *gitPlatform) Observe(_ context.Context, obs agent.Observation) error {
 }
 
 func (*gitPlatform) Model(context.Context, string) (*openresponses.Client, error) { return nil, nil }
+
+// listed turns the files of an open call into changed_files as the connector
+// returns it: a path, a kind of change and the git blob id, and no content.
+func listed(files any) []any {
+	var out []any
+	list, _ := files.([]any)
+	for _, f := range list {
+		m, _ := f.(map[string]any)
+		content, _ := m["content"].(string)
+		sum := sha1.Sum([]byte("blob " + strconv.Itoa(len(content)) + "\x00" + content)) //nolint:gosec // git
+		out = append(out, map[string]any{"path": m["path"], "change": "added", "blob_sha": hex.EncodeToString(sum[:])})
+	}
+	return out
+}
 
 const headSHA = "0123456789abcdef0123456789abcdef01234567"
 

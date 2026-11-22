@@ -5,9 +5,13 @@ package isolate_test
 
 import (
 	"context"
+	"crypto/sha1" //nolint:gosec // git object ids are SHA-1 in a SHA-1 repository
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -74,6 +78,10 @@ type gitHost struct {
 	foreign []map[string]any
 	tamper  bool
 	noFiles bool
+	// truncated makes the list of changed files carry the truncated flag.
+	// rename makes the first entry a rename. wide makes the repository use
+	// SHA-256 object ids.
+	truncated, rename, wide bool
 
 	opened []map[string]any
 	prs    map[string]*mr
@@ -128,7 +136,8 @@ func (g *gitHost) CallToolProto(
 		g.opened = append(g.opened, args)
 		ref = fmt.Sprintf("acme/manifests#%d", len(g.opened))
 		files, _ := args["files"].([]any)
-		m := &mr{state: "open", sha: sha(len(g.opened)), branch: args["branch"].(string)} //nolint:forcetypeassert // test
+		branch, _ := args["branch"].(string)
+		m := &mr{state: "open", sha: g.commit(len(g.opened)), branch: branch}
 		for _, f := range files {
 			m.files = append(m.files, f.(map[string]any)) //nolint:forcetypeassert // the mock controls the args
 		}
@@ -147,11 +156,10 @@ func (g *gitHost) CallToolProto(
 		}
 		result = map[string]any{"state": m.state, "source_branch": m.branch, "head_sha": m.sha, "pipeline_green": g.green}
 		if !g.noFiles {
-			files := make([]any, 0, len(m.files))
-			for _, f := range m.files {
-				files = append(files, f)
+			result["changed_files"] = g.listFiles(m)
+			if g.truncated {
+				result["changed_files_truncated"] = true
 			}
-			result["changed_files"] = files
 		}
 	case isolate.ToolClose:
 		if !g.tools {
@@ -170,6 +178,47 @@ func (g *gitHost) CallToolProto(
 		g.t.Fatalf("the agent called %s: an isolation never reads a health signal or reverts", id)
 	}
 	return g.answer(response, result)
+}
+
+// commit is the head commit of the nth merge request.
+func (g *gitHost) commit(n int) string {
+	if g.wide {
+		return fmt.Sprintf("%064x", n)
+	}
+	return sha(n)
+}
+
+// blob is the git blob id of a file, computed as git does.
+func (g *gitHost) blob(content string) string {
+	data := []byte("blob " + strconv.Itoa(len(content)) + "\x00" + content)
+	if g.wide {
+		sum := sha256.Sum256(data)
+		return hex.EncodeToString(sum[:])
+	}
+	sum := sha1.Sum(data) //nolint:gosec // git object ids are SHA-1 in a SHA-1 repository
+	return hex.EncodeToString(sum[:])
+}
+
+// listFiles is changed_files as the connector returns it: a path, a kind of
+// change and a blob id, and no content. A deleted file has an empty blob id.
+func (g *gitHost) listFiles(m *mr) []any {
+	out := make([]any, 0, len(m.files))
+	for i, f := range m.files {
+		path, _ := f["path"].(string)
+		entry := map[string]any{"path": path, "change": "deleted", "blob_sha": ""}
+		if f["delete"] != true {
+			content, _ := f["content"].(string)
+			entry["change"], entry["blob_sha"] = "added", g.blob(content)
+			if _, has := g.base[path]; has {
+				entry["change"] = "modified"
+			}
+		}
+		if g.rename && i == 0 {
+			entry["change"], entry["previous_path"] = "renamed", "contain/old.yaml"
+		}
+		out = append(out, entry)
+	}
+	return out
 }
 
 // merge answers merge_merge_request.
@@ -912,6 +961,8 @@ func TestIsolate_MergeRequestWithAForeignChangeIsNeverMerged(t *testing.T) {
 		},
 		"the policy changed": func(g *gitHost) { g.tamper = true },
 		"no file list":       func(g *gitHost) { g.noFiles = true },
+		"a cut file list":    func(g *gitHost) { g.truncated = true },
+		"a renamed file":     func(g *gitHost) { g.rename = true },
 	}
 	for name, set := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -1004,5 +1055,27 @@ func TestRelease_PersonClosesTheReleaseMergeRequest(t *testing.T) {
 	stopped := strings.Contains(joined(sum), "a person must decide")
 	if !stopped || len(g.opened) != opened || g.count(isolate.ToolMerge) != merges {
 		t.Fatalf("opened = %d, merges = %d: %v", len(g.opened), g.count(isolate.ToolMerge), sum.Lines)
+	}
+}
+
+// A repository with SHA-256 object ids has a head commit of 64 characters. The
+// agent then computes the blob ids with SHA-256, and it refuses a change whose
+// blob differs.
+func TestIsolate_Sha256Repository(t *testing.T) {
+	g, st, p := setup(t)
+	g.wide = true
+	w := workload(t)
+	sum, err := p.Isolate(context.Background(), incidentKey, w)
+	if err != nil || !sum.Merged {
+		t.Fatalf("merged = %v, err = %v: %v", sum.Merged, err, sum.Lines)
+	}
+	if rec := st.records["ir_isolation_merged_"+repo.Key(incidentKey, w)+"_1"]; !strings.HasSuffix(rec, g.commit(1)) {
+		t.Errorf("record = %q", rec)
+	}
+	g2, _, p2 := setup(t)
+	g2.wide, g2.tamper = true, true
+	sum2, err := p2.Isolate(context.Background(), incidentKey, w)
+	if err != nil || sum2.Merged || g2.count(isolate.ToolMerge) != 0 {
+		t.Fatalf("merged = %v, err = %v: %v", sum2.Merged, err, sum2.Lines)
 	}
 }

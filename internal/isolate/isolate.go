@@ -448,16 +448,23 @@ func (s step) read(ctx context.Context, m mrRecord, want Change) (MR, bool, erro
 // files of the expected change, or returns "". The branch name is easy to
 // guess, so a person can make the branch first and the commit of the agent
 // lands on top of theirs. The head commit then names that history too. So
-// the agent compares the files, and it merges only an exact match.
+// the agent compares the files, and it merges only an exact match. The host
+// returns no content. It returns the git blob id of each file after the
+// change, and the agent computes the blob id of each file that it expects.
 func filesProblem(mr MR, want Change) string {
-	if !mr.FilesKnown {
+	switch {
+	case !mr.FilesKnown:
 		return "the host does not return the files that the merge request changes"
-	}
-	if len(mr.Files) != len(want.Files) {
+	case mr.Truncated:
+		return "the host cut the list of changed files, so the agent cannot compare it"
+	case len(mr.Files) != len(want.Files):
 		return fmt.Sprintf("it changes %d files and the expected change has %d", len(mr.Files), len(want.Files))
 	}
-	got := map[string]File{}
+	got := map[string]ChangedFile{}
 	for _, f := range mr.Files {
+		if f.Change == "renamed" || f.PreviousPath != "" {
+			return "it renames the file " + respond.Clean(f.Path)
+		}
 		got[f.Path] = f
 	}
 	for _, w := range want.Files {
@@ -465,8 +472,11 @@ func filesProblem(mr MR, want Change) string {
 		switch {
 		case !ok:
 			return "it does not change the expected file " + respond.Clean(w.Path)
-		case g.Delete != w.Delete || (!w.Delete && g.Content != w.Content):
-			return "it changes the file " + respond.Clean(w.Path) + " in another way than expected"
+		case w.Delete && (g.Change != "deleted" || g.BlobSHA != ""):
+			return "it changes the file " + respond.Clean(w.Path) + " in another way than a delete"
+		case !w.Delete && ((g.Change != "added" && g.Change != "modified") ||
+			g.BlobSHA != gitBlobSHA(mr.HeadSHA, w.Content)):
+			return "it changes the file " + respond.Clean(w.Path) + " to a content that the agent did not write"
 		}
 	}
 	return ""
