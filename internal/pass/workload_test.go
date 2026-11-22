@@ -26,6 +26,9 @@ import (
 type gitPlatform struct {
 	calls   []string
 	records map[string]string
+	branch  string
+	merged  bool
+	files   map[string]string
 }
 
 func (g *gitPlatform) CallToolProto(
@@ -34,14 +37,28 @@ func (g *gitPlatform) CallToolProto(
 	in := request.(*structpb.Struct).AsMap() //nolint:forcetypeassert // the test controls the request type
 	id, _ := in["id"].(string)
 	g.calls = append(g.calls, id)
+	args, _ := in["args"].(map[string]any)
 	var result map[string]any
 	switch id {
 	case "mcp:gitlab-fixloop:open_merge_request":
+		g.branch, _ = args["branch"].(string)
+		for _, f := range args["files"].([]any) { //nolint:forcetypeassert // the test controls the args
+			m := f.(map[string]any)                                //nolint:forcetypeassert // the test controls the args
+			g.files[m["path"].(string)], _ = m["content"].(string) //nolint:forcetypeassert // the test controls the args
+		}
 		result = map[string]any{"merge_request": "acme/manifests!4"}
 	case "mcp:gitlab-fixloop:merge_merge_request":
+		g.merged = true
 		result = map[string]any{"state": "merged", "merged": true}
 	case "mcp:gitlab-fixloop:merge_request_state":
-		result = map[string]any{"state": "merged"}
+		state := "open"
+		if g.merged {
+			state = "merged"
+		}
+		result = map[string]any{"state": state, "source_branch": g.branch}
+	case "mcp:gitlab-fixloop:read_file":
+		c, found := g.files[args["path"].(string)] //nolint:forcetypeassert // the test controls the args
+		result = map[string]any{"found": found, "content": c}
 	default:
 		return errors.New("unknown tool " + id)
 	}
@@ -85,25 +102,25 @@ func workloadTask(task string) agent.Task {
 		pass.ContextKeyIncident: "incident-7", pass.ContextKeyTask: task,
 		pass.ContextKeyNamespace: "payments", pass.ContextKeyLabels: "app=ledger",
 		pass.ContextKeyConnector: "gitlab-fixloop", pass.ContextKeyProject: "acme/manifests",
-		pass.ContextKeyBaseBranch: "main",
+		pass.ContextKeyBaseBranch: "main", pass.ContextKeyPolicyKind: "cilium",
 	}}
 }
 
 func TestRun_IsolateOpensMergesAndRecords(t *testing.T) {
-	g := &gitPlatform{records: map[string]string{}}
+	g := &gitPlatform{records: map[string]string{}, files: map[string]string{}}
 	res, err := pass.Run(context.Background(), g, liveReader{g}, noCalls{}, workloadTask(pass.TaskIsolate))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if res.Status != a2a.TaskStateCompleted || res.Metadata["isolated"] != true {
+	if res.Status != a2a.TaskStateCompleted || res.Metadata["merged"] != true || res.Metadata["on_base"] != true {
 		t.Fatalf("status = %v, metadata = %v, output = %s", res.Status, res.Metadata, res.Output)
 	}
-	if len(g.calls) != 3 || !strings.HasPrefix(g.calls[0], "mcp:gitlab-fixloop:") {
+	if len(g.calls) != 5 || !strings.HasPrefix(g.calls[0], "mcp:gitlab-fixloop:") {
 		t.Fatalf("calls = %v", g.calls)
 	}
 	found := false
 	for name := range g.records {
-		found = found || strings.HasPrefix(name, "ir_isolated_")
+		found = found || strings.HasPrefix(name, "ir_isolation_merged_")
 	}
 	if !found {
 		t.Fatalf("no isolated record: %v", g.records)
@@ -119,11 +136,14 @@ func TestRun_WorkloadTaskRefusesBadContext(t *testing.T) {
 		"system namespace":  func(m map[string]any) { m[pass.ContextKeyNamespace] = "kube-system" },
 		"no labels":         func(m map[string]any) { m[pass.ContextKeyLabels] = "" },
 		"not a git host":    func(m map[string]any) { m[pass.ContextKeyConnector] = "okta-response" },
+		"no policy kind":    func(m map[string]any) { delete(m, pass.ContextKeyPolicyKind) },
+		"github dir":        func(m map[string]any) { m[pass.ContextKeyDir] = ".github" },
+		"controller ns":     func(m map[string]any) { m[pass.ContextKeyNamespace] = "argocd" },
 		"no project":        func(m map[string]any) { delete(m, pass.ContextKeyProject) },
 		"label with a line": func(m map[string]any) { m[pass.ContextKeyLabels] = "a=b\nc: d" },
 	} {
 		t.Run(name, func(t *testing.T) {
-			g := &gitPlatform{records: map[string]string{}}
+			g := &gitPlatform{records: map[string]string{}, files: map[string]string{}}
 			task := workloadTask(pass.TaskIsolate)
 			mutate(task.Context)
 			res, err := pass.Run(context.Background(), g, liveReader{g}, noCalls{}, task)

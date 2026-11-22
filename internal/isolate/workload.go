@@ -111,7 +111,8 @@ func checkLabel(k, v string) error {
 	if name == "" || len(name) > 63 || !labelPart.MatchString(name) {
 		return errors.New("isolate: a label key is not a Kubernetes label key")
 	}
-	if v == "" || len(v) > 63 || !labelPart.MatchString(v) {
+	// Kubernetes allows an empty label value.
+	if len(v) > 63 || (v != "" && !labelPart.MatchString(v)) {
 		return errors.New("isolate: a label value is not a Kubernetes label value")
 	}
 	return nil

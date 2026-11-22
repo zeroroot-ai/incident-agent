@@ -15,8 +15,8 @@ One dispatch is one task on one incident. The task context names both.
 | `cause` | Raises one finding for the cause of the incident and links the Incident to it with `CAUSED_BY`. | `internal/cause` |
 | `release` | Releases each containment that the daemon confirms the agent made, after the cause finding that this agent raised is `verified`. | `internal/contain` |
 
-| `isolate` | Opens and merges a merge request in the GitOps repo of the buyer. It adds a NetworkPolicy that denies all ingress and egress for the labels of one workload, and a lock file. | `internal/isolate` |
-| `release_workload` | After the cause finding that this agent raised is `verified`, opens and merges a merge request that removes both files. | `internal/isolate` |
+| `isolate` | Opens and merges a merge request in the GitOps repo of the buyer. It adds a policy of the kind that the dispatch names (`cilium`, `admin` or `networkpolicy`) that denies all ingress and egress for the labels of one workload, and a lock file. It trusts a merge request only on the expected branch in the configured project. | `internal/isolate` |
+| `release_workload` | After the cause finding that this agent raised is `verified` and that carries its author and tags, opens and merges a merge request that removes both files. It closes an isolation merge request that never merged. | `internal/isolate` |
 
 Each task writes what it did on the Incident node (`internal/emit`).
 
@@ -89,7 +89,7 @@ Each value from the graph and from a tool result is untrusted data.
 |---|---|---|
 | `incident` | yes | The key of the Incident node. |
 | `ir.task` | yes | `contain`, `cause`, `release`, `isolate` or `release_workload`. |
-| `ir.workload.*`, `ir.gitops.*` | for `isolate` and `release_workload` | The workload and the GitOps repo. The README lists each key. |
+| `ir.workload.*`, `ir.gitops.*` | for `isolate` and `release_workload` | The workload and the GitOps repo. The README lists each key. `ir.gitops.policy_kind` has no default. |
 
 The goal is not a fallback for the incident. The goal of a mission node is a sentence for a person, not a key. A dispatch with a missing or unknown key fails the run before any call.
 

@@ -199,6 +199,12 @@ func (s Step) ask(ctx context.Context, inc incident.Incident, places []incident.
 // cause step uses it before it raises a finding, and the release pass uses it
 // to accept only the cause of this agent.
 type Finder struct {
+	// Bound makes the finder take only a finding that carries the author and
+	// the two tags of this agent, as the daemon returns them. A title prefix
+	// and a category are text that any writer of the mission can copy, so the
+	// release does not trust them alone. A finder that is not Bound is for
+	// the cause step, which only avoids a second finding.
+	Bound    bool
 	Findings interface {
 		GetFindings(ctx context.Context, filter finding.Filter) ([]*finding.Finding, error)
 	}
@@ -221,7 +227,7 @@ func (f Finder) OwnCause(ctx context.Context, incidentKey string) (string, error
 	}
 	ids := make([]string, 0, 1)
 	for _, fd := range got {
-		if Own(fd, incidentKey) {
+		if Own(fd, incidentKey) && (!f.Bound || bound(fd, incidentKey)) {
 			ids = append(ids, fd.ID)
 		}
 	}
@@ -251,6 +257,15 @@ func Own(f *finding.Finding, incidentKey string) bool {
 		return false
 	}
 	return true
+}
+
+// bound reports whether f carries the author and both tags of this agent.
+// The daemon sets none of them today: it drops the author and the tags of a
+// finding when it stores and when it returns it. So no finding is bound, and
+// a release waits. That is the safe side.
+func bound(f *finding.Finding, incidentKey string) bool {
+	return f.AgentName == AgentName &&
+		slices.Contains(f.Tags, AgentName) && slices.Contains(f.Tags, tagOf(incidentKey))
 }
 
 // tagOf is the tag that names the incident of a cause finding.

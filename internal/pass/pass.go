@@ -132,7 +132,7 @@ func Run(
 	}
 	resp := contain.Pass{
 		Reader: reader, Invoker: invoker, Recorder: emitter, Calls: calls,
-		Causes: cause.Finder{Findings: p},
+		Causes: cause.Finder{Findings: p, Bound: true},
 	}
 
 	switch kind {
@@ -179,7 +179,11 @@ func runWorkload(
 	if err != nil {
 		return failed(), fmt.Errorf("pass: %w", err)
 	}
-	ip := isolate.Pass{Reader: reader, Host: host, Recorder: emitter, Causes: cause.Finder{Findings: p}, Repo: repo}
+	// The release trusts only a cause finding that the daemon binds to this agent.
+	ip := isolate.Pass{
+		Reader: reader, Host: host, Recorder: emitter, Repo: repo,
+		Causes: cause.Finder{Findings: p, Bound: true},
+	}
 	var sum isolate.Summary
 	if kind == TaskIsolate {
 		sum, err = ip.Isolate(ctx, key, w)
@@ -192,7 +196,8 @@ func runWorkload(
 	return agent.Result{
 		Status: a2a.TaskStateCompleted, Output: WorkloadReport(kind, sum),
 		Metadata: map[string]any{
-			"task": kind, "incident": key, "calls": sum.Calls, "isolated": sum.Isolated, "released": sum.Released,
+			"task": kind, "incident": key, "calls": sum.Calls, "merged": sum.Merged, "on_base": sum.OnBase,
+			"released": sum.Released,
 		},
 	}, nil
 }
@@ -206,6 +211,13 @@ const (
 	ContextKeyProject    = "ir.gitops.project"
 	ContextKeyBaseBranch = "ir.gitops.base_branch"
 	ContextKeyDir        = "ir.gitops.dir"
+	// ContextKeyCluster names the cluster when one repo serves many clusters.
+	ContextKeyCluster = "ir.gitops.cluster"
+	// ContextKeyPolicyKind is cilium, admin or networkpolicy.
+	ContextKeyPolicyKind = "ir.gitops.policy_kind"
+	// ContextKeyControllerNS lists more namespaces of the GitOps controller,
+	// separated by commas. The agent never isolates a workload there.
+	ContextKeyControllerNS = "ir.gitops.controller_namespaces"
 )
 
 func workloadOf(task agent.Task) (isolate.Workload, isolate.Repo, error) {
@@ -218,6 +230,13 @@ func workloadOf(task agent.Task) (isolate.Workload, isolate.Repo, error) {
 		Project:    ctxString(task, ContextKeyProject),
 		BaseBranch: ctxString(task, ContextKeyBaseBranch),
 		Dir:        ctxString(task, ContextKeyDir),
+		Cluster:    ctxString(task, ContextKeyCluster),
+		PolicyKind: ctxString(task, ContextKeyPolicyKind),
+	}
+	for _, ns := range strings.Split(ctxString(task, ContextKeyControllerNS), ",") {
+		if ns = strings.TrimSpace(ns); ns != "" {
+			repo.ControllerNamespaces = append(repo.ControllerNamespaces, ns)
+		}
 	}
 	if repo.Dir == "" {
 		repo.Dir = isolate.DefaultDir

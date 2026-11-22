@@ -29,6 +29,11 @@ const (
 // agent, when the dispatch names none.
 const DefaultDir = "zeroroot-containment"
 
+// AdminPriority is the priority of an AdminNetworkPolicy. A lower number is
+// evaluated first. The policy of a cluster admin starts at 0 only by choice,
+// so 1 is ahead of nearly each other policy.
+const AdminPriority = 1
+
 // File is one file of a change to the repo of the buyer.
 type File struct {
 	Path string
@@ -50,23 +55,35 @@ type Change struct {
 }
 
 // Key is the key of one containment: the first 16 hexadecimal characters of
-// the SHA-256 of the incident key, the namespace and the labels. A name that
-// the agent writes into a repo, a branch or a record holds the key and never
-// a value of the graph.
-func Key(incidentKey string, w Workload) string {
+// the SHA-256 of the cluster, the incident key, the namespace and the labels.
+// A name that the agent writes into a repo, a branch or a record holds the
+// key and never a value of the graph.
+func (r Repo) Key(incidentKey string, w Workload) string {
 	h := sha256.New()
-	for _, part := range append([]string{incidentKey, w.Namespace}, w.sortedLabels()...) {
+	for _, part := range append([]string{r.Cluster, incidentKey, w.Namespace}, w.sortedLabels()...) {
 		h.Write([]byte(part))
 		h.Write([]byte{0})
 	}
 	return hex.EncodeToString(h.Sum(nil))[:16]
 }
 
-// PolicyName is the name of the NetworkPolicy of one containment.
+// PolicyName is the name of the policy of one containment.
 func PolicyName(key string) string { return "zeroroot-isolate-" + key }
 
-func policyPath(dir, key string) string { return dir + "/" + PolicyName(key) + ".yaml" }
-func lockPath(dir, key string) string   { return dir + "/" + PolicyName(key) + ".lock.yaml" }
+// IsolateBranch is the branch of the isolation merge request of a generation.
+func IsolateBranch(key string, gen int) string {
+	return "zeroroot/isolate-" + key + "-" + strconv.Itoa(gen)
+}
+
+// ReleaseBranch is the branch of the release merge request of a generation.
+func ReleaseBranch(key string, gen int) string {
+	return "zeroroot/release-" + key + "-" + strconv.Itoa(gen)
+}
+
+// PolicyPath is the path of the policy file of a containment.
+func (r Repo) PolicyPath(key string) string { return r.base() + "/" + PolicyName(key) + ".yaml" }
+
+func (r Repo) lockPath(key string) string { return r.base() + "/" + PolicyName(key) + ".lock.yaml" }
 
 // quote writes a string as a YAML double-quoted scalar. A JSON string is one.
 func quote(s string) string {
@@ -78,66 +95,104 @@ func quote(s string) string {
 	return string(b)
 }
 
-// Isolate returns the change that isolates the workload: a NetworkPolicy that
+// Isolate returns the change that isolates the workload: a policy that
 // denies all ingress and all egress, and the lock file.
-func Isolate(dir, incidentKey string, w Workload, gen int) Change {
-	key := Key(incidentKey, w)
+func (r Repo) Isolate(incidentKey string, w Workload, gen int) Change {
+	key := r.Key(incidentKey, w)
 	ref := cause.Ref(incidentKey)
 	return Change{
-		Branch: "zeroroot/isolate-" + key + "-" + strconv.Itoa(gen),
+		Branch: IsolateBranch(key, gen),
 		Title:  "contain(incident-" + ref + "): isolate a workload",
 		Description: "The incident agent isolates one workload of the incident " + ref + ".\n" +
 			"The policy denies all ingress and all egress for the pods with the labels below.\n" +
 			"Do not revert this merge request while the incident is open.\n" +
 			"The agent removes the policy after the cause of the incident is verified.\n",
 		Files: []File{
-			{Path: policyPath(dir, key), Content: policyYAML(key, ref, w)},
-			{Path: lockPath(dir, key), Content: lockYAML(dir, key, ref, w)},
+			{Path: r.PolicyPath(key), Content: r.policyYAML(key, ref, w)},
+			{Path: r.lockPath(key), Content: r.lockYAML(key, ref, w)},
 		},
 	}
 }
 
 // Release returns the change that removes the two files of a containment.
-func Release(dir, incidentKey string, w Workload, gen int) Change {
-	key := Key(incidentKey, w)
+func (r Repo) Release(incidentKey string, w Workload, gen int) Change {
+	key := r.Key(incidentKey, w)
 	ref := cause.Ref(incidentKey)
 	return Change{
-		Branch: "zeroroot/release-" + key + "-" + strconv.Itoa(gen),
+		Branch: ReleaseBranch(key, gen),
 		Title:  "contain(incident-" + ref + "): release a workload",
 		Description: "The cause of the incident " + ref + " is verified.\n" +
 			"The incident agent removes the policy that isolated one workload.\n",
 		Files: []File{
-			{Path: policyPath(dir, key), Delete: true},
-			{Path: lockPath(dir, key), Delete: true},
+			{Path: r.PolicyPath(key), Delete: true},
+			{Path: r.lockPath(key), Delete: true},
 		},
 	}
 }
 
-func policyYAML(key, ref string, w Workload) string {
+// meta writes the metadata of the policy. A cluster-scoped kind has no
+// namespace.
+func (r Repo) meta(b *strings.Builder, key, ref, namespace string) {
+	b.WriteString("metadata:\n")
+	fmt.Fprintf(b, "  name: %s\n", PolicyName(key))
+	if namespace != "" {
+		fmt.Fprintf(b, "  namespace: %s\n", namespace)
+	}
+	fmt.Fprintf(b, "  labels:\n    %s: %s\n", LabelContainment, quote(key))
+	b.WriteString("  annotations:\n")
+	fmt.Fprintf(b, "    %s: %s\n", AnnotationIncident, quote(ref))
+	fmt.Fprintf(b, "    %s: %s\n", AnnotationRule, quote("while the incident "+ref+" is open"))
+}
+
+func matchLabels(b *strings.Builder, indent string, w Workload) {
+	b.WriteString(indent + "matchLabels:\n")
+	for _, kv := range w.sortedLabels() {
+		k, v, _ := strings.Cut(kv, "=")
+		fmt.Fprintf(b, "%s  %s: %s\n", indent, quote(k), quote(v))
+	}
+}
+
+// policyYAML renders the policy of the kind of the repo. No kind has a DNS
+// allow. A workload that is isolated cannot resolve a name, on purpose.
+func (r Repo) policyYAML(key, ref string, w Workload) string {
 	var b strings.Builder
 	b.WriteString("# Written by the Zero Root incident agent.\n")
 	b.WriteString("# Do not revert or edit this file while the incident is open.\n")
-	b.WriteString("apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n")
-	fmt.Fprintf(&b, "  name: %s\n  namespace: %s\n", PolicyName(key), w.Namespace)
-	fmt.Fprintf(&b, "  labels:\n    %s: %s\n", LabelContainment, quote(key))
-	b.WriteString("  annotations:\n")
-	fmt.Fprintf(&b, "    %s: %s\n", AnnotationIncident, quote(ref))
-	fmt.Fprintf(&b, "    %s: %s\n", AnnotationRule, quote("while the incident "+ref+" is open"))
-	b.WriteString("spec:\n  podSelector:\n    matchLabels:\n")
-	for _, kv := range w.sortedLabels() {
-		k, v, _ := strings.Cut(kv, "=")
-		fmt.Fprintf(&b, "      %s: %s\n", quote(k), quote(v))
+	switch r.PolicyKind {
+	case KindCilium:
+		b.WriteString("apiVersion: cilium.io/v2\nkind: CiliumNetworkPolicy\n")
+		r.meta(&b, key, ref, w.Namespace)
+		b.WriteString("spec:\n  endpointSelector:\n")
+		matchLabels(&b, "    ", w)
+		b.WriteString("  ingressDeny:\n    - fromEntities:\n        - all\n")
+		b.WriteString("  egressDeny:\n    - toEntities:\n        - all\n")
+	case KindAdmin:
+		b.WriteString("apiVersion: policy.networking.k8s.io/v1alpha1\nkind: AdminNetworkPolicy\n")
+		r.meta(&b, key, ref, "")
+		fmt.Fprintf(&b, "spec:\n  priority: %d\n  subject:\n    pods:\n      namespaceSelector:\n", AdminPriority)
+		fmt.Fprintf(&b, "        matchLabels:\n          kubernetes.io/metadata.name: %s\n", quote(w.Namespace))
+		b.WriteString("      podSelector:\n")
+		matchLabels(&b, "        ", w)
+		b.WriteString("  ingress:\n    - name: deny-all-ingress\n      action: Deny\n      from:\n        - namespaces: {}\n")
+		b.WriteString("  egress:\n    - name: deny-all-egress\n      action: Deny\n      to:\n        - namespaces: {}\n")
+		b.WriteString("        - networks:\n            - 0.0.0.0/0\n            - \"::/0\"\n")
+	default:
+		b.WriteString("apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\n")
+		r.meta(&b, key, ref, w.Namespace)
+		b.WriteString("spec:\n  podSelector:\n")
+		matchLabels(&b, "    ", w)
+		b.WriteString("  policyTypes:\n    - Ingress\n    - Egress\n")
 	}
-	b.WriteString("  policyTypes:\n    - Ingress\n    - Egress\n")
 	return b.String()
 }
 
-func lockYAML(dir, key, ref string, w Workload) string {
+func (r Repo) lockYAML(key, ref string, w Workload) string {
 	var b strings.Builder
 	b.WriteString("# Written by the Zero Root incident agent.\n")
 	b.WriteString("# While state is open, nobody reverts the merge request that added the policy.\n")
 	b.WriteString("# The incident agent removes this file and the policy after the cause is verified.\n")
 	fmt.Fprintf(&b, "containment: %s\nincident: %s\nstate: open\n", quote(key), quote(ref))
-	fmt.Fprintf(&b, "policy: %s\nnamespace: %s\n", quote(policyPath(dir, key)), quote(w.Namespace))
+	fmt.Fprintf(&b, "kind: %s\npolicy: %s\n", quote(r.PolicyKind), quote(r.PolicyPath(key)))
+	fmt.Fprintf(&b, "namespace: %s\n", quote(w.Namespace))
 	return b.String()
 }

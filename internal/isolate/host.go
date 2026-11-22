@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"unicode"
 
@@ -19,25 +20,59 @@ import (
 // manifests github-fixloop.yaml and gitlab-fixloop.yaml).
 var gitHosts = map[string]bool{"github-fixloop": true, "gitlab-fixloop": true}
 
-// The tools of a Git host connector.
+// The tools of a Git host connector. The first two exist in v0.2.0 of the
+// servers in zeroroot-ai/connectors. The other three do not exist yet. The
+// daemon refuses a call of a tool that does not exist, and the call changes
+// nothing. The README states the contract of each.
 const (
-	// ToolOpen opens a merge request with a set of file changes. The two
-	// fixloop servers of zeroroot-ai/connectors v0.2.0 do not offer it yet.
-	// The call fails with a refusal of the daemon until they do, and it
-	// changes nothing. The README states the contract.
-	ToolOpen = "open_merge_request"
 	// ToolState reads the state of a merge request.
 	ToolState = "merge_request_state"
 	// ToolMerge merges a merge request.
 	ToolMerge = "merge_merge_request"
+	// ToolOpen opens a merge request with a set of file changes.
+	ToolOpen = "open_merge_request"
+	// ToolClose closes a merge request without a merge.
+	ToolClose = "close_merge_request"
+	// ToolReadFile reads one file on a branch.
+	ToolReadFile = "read_file"
 )
 
 // StateMerged is the state that merge_request_state returns for a merged
 // merge request.
 const StateMerged = "merged"
 
+// StateOpen is the state of a merge request that waits for its merge.
+const StateOpen = "open"
+
 // MaxRefBytes bounds a merge request reference.
 const MaxRefBytes = 200
+
+// The kinds of policy. Each is a different object in the repo of the buyer.
+const (
+	// KindCilium is a CiliumNetworkPolicy with egressDeny and ingressDeny.
+	// A deny rule wins over each allow rule of Cilium.
+	KindCilium = "cilium"
+	// KindAdmin is an AdminNetworkPolicy with the action Deny at a high
+	// priority. It is evaluated before each NetworkPolicy.
+	KindAdmin = "admin"
+	// KindNetworkPolicy is a NetworkPolicy. Policies add up, so another
+	// policy that allows traffic still allows it. See BypassNote.
+	KindNetworkPolicy = "networkpolicy"
+)
+
+// BypassNote is what the report and the incident record say about a
+// NetworkPolicy isolation.
+const BypassNote = "NetworkPolicy objects add up, so another policy that allows traffic still allows it. " +
+	"A CNI that does not enforce policy, and a pod with hostNetwork, bypass it. " +
+	"Use the policy kind cilium or admin to get a deny that wins."
+
+// defaultControllerNamespaces hold the GitOps controller of the buyer. A
+// policy that denies all traffic there stops the controller, so it can no
+// longer apply the release. The dispatch can name more.
+var defaultControllerNamespaces = []string{"argocd", "flux-system"}
+
+// dirPart is one segment of the directory or of the cluster name.
+var dirPart = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 
 // Repo names the GitOps repo of the buyer and the connector that reaches it.
 type Repo struct {
@@ -50,6 +85,14 @@ type Repo struct {
 	BaseBranch string
 	// Dir is the directory of the repo that holds the files of the agent.
 	Dir string
+	// Cluster names the cluster when one repo serves many clusters. The files
+	// go in Dir/Cluster. It can be empty.
+	Cluster string
+	// PolicyKind is one of KindCilium, KindAdmin and KindNetworkPolicy.
+	PolicyKind string
+	// ControllerNamespaces are namespaces of the GitOps controller, besides
+	// the defaults. The agent never isolates a workload in them.
+	ControllerNamespaces []string
 }
 
 // Check refuses a repo that the agent cannot use.
@@ -60,13 +103,81 @@ func (r Repo) Check() error {
 	if strings.TrimSpace(r.Project) == "" || strings.TrimSpace(r.BaseBranch) == "" {
 		return errors.New("isolate: the GitOps repo needs a project and a base branch")
 	}
-	if strings.IndexFunc(r.Project+r.BaseBranch+r.Dir, unicode.IsControl) >= 0 {
+	if strings.IndexFunc(r.Project+r.BaseBranch, unicode.IsControl) >= 0 {
 		return errors.New("isolate: the GitOps repo holds a control character")
 	}
-	if strings.HasPrefix(r.Dir, "/") || strings.Contains(r.Dir, "..") {
-		return errors.New("isolate: the directory must stay inside the repo")
+	if err := checkDir(r.Dir); err != nil {
+		return err
+	}
+	if r.Cluster != "" && (strings.Contains(r.Cluster, "/") || !dirPart.MatchString(r.Cluster)) {
+		return errors.New("isolate: the cluster name must be one path segment of a-z, 0-9, dot, underscore and dash")
+	}
+	switch r.PolicyKind {
+	case KindCilium, KindAdmin, KindNetworkPolicy:
+	default:
+		return fmt.Errorf("isolate: the policy kind %q is not %s, %s or %s",
+			respond.Clean(r.PolicyKind), KindCilium, KindAdmin, KindNetworkPolicy)
 	}
 	return nil
+}
+
+// checkDir refuses a directory that is empty, that is not made of plain
+// segments, or that starts a hidden segment. A hidden segment such as .github
+// holds the workflows of the repo, and a merge request that writes there runs
+// code with the credentials of the repo.
+func checkDir(dir string) error {
+	if dir == "" {
+		return errors.New("isolate: the directory is empty")
+	}
+	for _, seg := range strings.Split(dir, "/") {
+		if !dirPart.MatchString(seg) {
+			return errors.New("isolate: the directory must hold only segments of a-z, 0-9, dot, underscore and dash, " +
+				"and no segment starts with a dot or a dash")
+		}
+	}
+	return nil
+}
+
+// base is the directory of the files of one cluster.
+func (r Repo) base() string {
+	if r.Cluster == "" {
+		return r.Dir
+	}
+	return r.Dir + "/" + r.Cluster
+}
+
+// Allows refuses a workload that the agent must not isolate with this repo:
+// one in the namespace of the GitOps controller.
+func (r Repo) Allows(w Workload) error {
+	for _, ns := range append(append([]string(nil), defaultControllerNamespaces...), r.ControllerNamespaces...) {
+		if w.Namespace == ns {
+			return fmt.Errorf("isolate: the namespace %s holds the GitOps controller, "+
+				"and a deny-all policy there stops it from applying the release", ns)
+		}
+	}
+	return nil
+}
+
+// refForm is the form of a merge request reference that the agent accepts:
+// the configured project, "#" or "!", and the number. A reference to another
+// project, or a URL, is refused.
+func (r Repo) refProblem(ref string) string {
+	switch {
+	case strings.TrimSpace(ref) == "":
+		return "no merge request reference"
+	case len(ref) > MaxRefBytes:
+		return "the merge request reference is too long"
+	}
+	rest, ok := strings.CutPrefix(ref, r.Project)
+	if !ok || len(rest) < 2 || (rest[0] != '#' && rest[0] != '!') {
+		return "the merge request is not in the configured project " + respond.Clean(r.Project)
+	}
+	for _, c := range rest[1:] {
+		if c < '0' || c > '9' {
+			return "the merge request reference does not end in a number"
+		}
+	}
+	return ""
 }
 
 // Call is the outcome of one tool call.
@@ -78,14 +189,26 @@ type Call struct {
 // Done reports whether the connector answered.
 func (c Call) Done() bool { return c.Outcome == respond.OutcomeDone }
 
+// MR is what the host says about one merge request.
+type MR struct {
+	State string
+	// SourceBranch is the branch of the merge request. The connector omits
+	// it for a merge request from a fork.
+	SourceBranch string
+}
+
 // Host is the Git host of the buyer, reached through the connector.
 type Host interface {
 	// Open opens the merge request of the change and returns its reference.
 	Open(ctx context.Context, c Change) (ref string, call Call, err error)
-	// State reads the state of a merge request on the host.
-	State(ctx context.Context, ref string) (state string, call Call, err error)
+	// State reads one merge request on the host.
+	State(ctx context.Context, ref string) (mr MR, call Call, err error)
 	// Merge merges the merge request. It returns whether the host merged it.
 	Merge(ctx context.Context, ref string) (merged bool, call Call, err error)
+	// Close closes the merge request without a merge.
+	Close(ctx context.Context, ref string) (call Call, err error)
+	// ReadFile reads one file on the base branch.
+	ReadFile(ctx context.Context, path string) (content string, found bool, call Call, err error)
 }
 
 // ToolHost is the Host that calls the tools of the connector through the
@@ -116,8 +239,8 @@ func (h *ToolHost) call(ctx context.Context, tool string, args map[string]any) (
 	return r, Call{Outcome: r.Outcome, Detail: r.Detail}, nil
 }
 
-// Open implements Host. The result must name the merge request, and the name
-// must be a plain reference: the agent sends it back to the connector.
+// Open implements Host. The result must name a merge request of the
+// configured project, because the agent sends the reference back.
 func (h *ToolHost) Open(ctx context.Context, c Change) (string, Call, error) {
 	files := make([]any, 0, len(c.Files))
 	for _, f := range c.Files {
@@ -137,20 +260,21 @@ func (h *ToolHost) Open(ctx context.Context, c Change) (string, Call, error) {
 		return "", call, err
 	}
 	ref, _ := r.Result["merge_request"].(string)
-	if problem := refProblem(ref); problem != "" {
+	if problem := h.repo.refProblem(ref); problem != "" {
 		return "", Call{Outcome: respond.OutcomeFailed, Detail: problem}, nil
 	}
 	return ref, call, nil
 }
 
 // State implements Host.
-func (h *ToolHost) State(ctx context.Context, ref string) (string, Call, error) {
+func (h *ToolHost) State(ctx context.Context, ref string) (MR, Call, error) {
 	r, call, err := h.call(ctx, ToolState, map[string]any{"merge_request": ref})
 	if err != nil || !call.Done() {
-		return "", call, err
+		return MR{}, call, err
 	}
 	state, _ := r.Result["state"].(string)
-	return state, call, nil
+	branch, _ := r.Result["source_branch"].(string)
+	return MR{State: state, SourceBranch: branch}, call, nil
 }
 
 // Merge implements Host. The connector merges only when the checks passed
@@ -164,16 +288,25 @@ func (h *ToolHost) Merge(ctx context.Context, ref string) (bool, Call, error) {
 	return merged, call, nil
 }
 
-// refProblem says why a value is not a merge request reference, or "".
-func refProblem(ref string) string {
-	switch {
-	case strings.TrimSpace(ref) == "":
-		return "the connector returned no merge request reference"
-	case len(ref) > MaxRefBytes:
-		return "the connector returned a merge request reference that is too long"
-	case strings.IndexFunc(ref, unicode.IsSpace) >= 0 || strings.IndexFunc(ref, unicode.IsControl) >= 0:
-		return "the connector returned a merge request reference that holds a space or a control character"
-	default:
-		return ""
+// Close implements Host.
+func (h *ToolHost) Close(ctx context.Context, ref string) (Call, error) {
+	_, call, err := h.call(ctx, ToolClose, map[string]any{"merge_request": ref})
+	return call, err
+}
+
+// ReadFile implements Host. It reads the base branch. A result that does not
+// say whether the file exists is a failure, never "found".
+func (h *ToolHost) ReadFile(ctx context.Context, path string) (string, bool, Call, error) {
+	r, call, err := h.call(ctx, ToolReadFile, map[string]any{
+		"project": h.repo.Project, "ref": h.repo.BaseBranch, "path": path,
+	})
+	if err != nil || !call.Done() {
+		return "", false, call, err
 	}
+	found, ok := r.Result["found"].(bool)
+	if !ok {
+		return "", false, Call{Outcome: respond.OutcomeFailed, Detail: "the result does not say if the file exists"}, nil
+	}
+	content, _ := r.Result["content"].(string)
+	return content, found, call, nil
 }

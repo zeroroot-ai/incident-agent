@@ -349,7 +349,8 @@ func HeldReason(ctx context.Context, causes CauseFinder, inc incident.Incident) 
 		return "", fmt.Errorf("release: find the cause of this agent: %w", err)
 	}
 	if own == "" {
-		return "this agent raised no cause finding for the incident in this mission, so each containment stays", nil
+		return "no cause finding is proven to be of this agent: the daemon must return the author " +
+			"and the tags of the finding. Each containment stays", nil
 	}
 	c, ok := inc.Cause(own)
 	if !ok {
