@@ -95,8 +95,8 @@ func (*gitPlatform) Model(context.Context, string) (*openresponses.Client, error
 // listed turns the files of an open call into changed_files as the connector
 // returns it: a path, a kind of change and the git blob id, and no content.
 func listed(files any) []any {
-	var out []any
 	list, _ := files.([]any)
+	out := make([]any, 0, len(list))
 	for _, f := range list {
 		m, _ := f.(map[string]any)
 		content, _ := m["content"].(string)
