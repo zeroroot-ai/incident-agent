@@ -32,6 +32,7 @@ import (
 	"github.com/zeroroot-ai/incident-agent/internal/contain"
 	"github.com/zeroroot-ai/incident-agent/internal/emit"
 	"github.com/zeroroot-ai/incident-agent/internal/incident"
+	"github.com/zeroroot-ai/incident-agent/internal/isolate"
 	"github.com/zeroroot-ai/incident-agent/internal/respond"
 	"github.com/zeroroot-ai/sdk/agent"
 	"github.com/zeroroot-ai/sdk/finding"
@@ -52,6 +53,11 @@ const (
 	TaskContain = "contain"
 	TaskCause   = "cause"
 	TaskRelease = "release"
+	// TaskIsolate isolates one Kubernetes workload with a merge request to
+	// the GitOps repo of the buyer.
+	TaskIsolate = "isolate"
+	// TaskReleaseWorkload removes that isolation with a second merge request.
+	TaskReleaseWorkload = "release_workload"
 )
 
 // Platform is everything that this agent needs from the harness: the tool
@@ -88,11 +94,11 @@ func IncidentKey(task agent.Task) (string, error) {
 // TaskOf reads the task of the dispatch.
 func TaskOf(task agent.Task) (string, error) {
 	switch t := ctxString(task, ContextKeyTask); t {
-	case TaskContain, TaskCause, TaskRelease:
+	case TaskContain, TaskCause, TaskRelease, TaskIsolate, TaskReleaseWorkload:
 		return t, nil
 	default:
-		return "", fmt.Errorf("pass: task context %q is %q: want %q, %q or %q",
-			ContextKeyTask, respond.Clean(t), TaskContain, TaskCause, TaskRelease)
+		return "", fmt.Errorf("pass: task context %q is %q: want %q, %q, %q, %q or %q",
+			ContextKeyTask, respond.Clean(t), TaskContain, TaskCause, TaskRelease, TaskIsolate, TaskReleaseWorkload)
 	}
 }
 
@@ -120,6 +126,9 @@ func Run(
 	invoker, err := respond.New(p)
 	if err != nil {
 		return failed(), err
+	}
+	if kind == TaskIsolate || kind == TaskReleaseWorkload {
+		return runWorkload(ctx, p, reader, emitter, task, kind, key)
 	}
 	resp := contain.Pass{
 		Reader: reader, Invoker: invoker, Recorder: emitter, Calls: calls,
@@ -154,6 +163,83 @@ func Run(
 		}
 		return done(kind, key, sum), nil
 	}
+}
+
+// runWorkload isolates or releases one Kubernetes workload through the Git
+// host connector.
+func runWorkload(
+	ctx context.Context, p Platform, reader incident.Reader, emitter *emit.Emitter,
+	task agent.Task, kind, key string,
+) (agent.Result, error) {
+	w, repo, err := workloadOf(task)
+	if err != nil {
+		return failed(), err
+	}
+	host, err := isolate.NewToolHost(p, repo)
+	if err != nil {
+		return failed(), fmt.Errorf("pass: %w", err)
+	}
+	ip := isolate.Pass{Reader: reader, Host: host, Recorder: emitter, Causes: cause.Finder{Findings: p}, Repo: repo}
+	var sum isolate.Summary
+	if kind == TaskIsolate {
+		sum, err = ip.Isolate(ctx, key, w)
+	} else {
+		sum, err = ip.Release(ctx, key, w)
+	}
+	if err != nil {
+		return failed(), fmt.Errorf("pass: %w", err)
+	}
+	return agent.Result{
+		Status: a2a.TaskStateCompleted, Output: WorkloadReport(kind, sum),
+		Metadata: map[string]any{
+			"task": kind, "incident": key, "calls": sum.Calls, "isolated": sum.Isolated, "released": sum.Released,
+		},
+	}, nil
+}
+
+// The task-context keys of the workload and of the GitOps repo. The mission
+// node sets them.
+const (
+	ContextKeyNamespace  = "ir.workload.namespace"
+	ContextKeyLabels     = "ir.workload.labels"
+	ContextKeyConnector  = "ir.gitops.connector"
+	ContextKeyProject    = "ir.gitops.project"
+	ContextKeyBaseBranch = "ir.gitops.base_branch"
+	ContextKeyDir        = "ir.gitops.dir"
+)
+
+func workloadOf(task agent.Task) (isolate.Workload, isolate.Repo, error) {
+	w, err := isolate.ParseWorkload(ctxString(task, ContextKeyNamespace), ctxString(task, ContextKeyLabels))
+	if err != nil {
+		return isolate.Workload{}, isolate.Repo{}, fmt.Errorf("pass: task context: %w", err)
+	}
+	repo := isolate.Repo{
+		Connector:  ctxString(task, ContextKeyConnector),
+		Project:    ctxString(task, ContextKeyProject),
+		BaseBranch: ctxString(task, ContextKeyBaseBranch),
+		Dir:        ctxString(task, ContextKeyDir),
+	}
+	if repo.Dir == "" {
+		repo.Dir = isolate.DefaultDir
+	}
+	if err := repo.Check(); err != nil {
+		return isolate.Workload{}, isolate.Repo{}, fmt.Errorf("pass: task context: %w", err)
+	}
+	return w, repo, nil
+}
+
+// WorkloadReport renders an isolate or release pass. It names each step. It
+// never says that the incident is resolved.
+func WorkloadReport(kind string, s isolate.Summary) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "incident-agent %s: incident %s: containment %s: %d calls", kind, s.Incident, s.Key, s.Calls)
+	if s.Held != "" {
+		b.WriteString("\n  released nothing: " + s.Held)
+	}
+	for _, l := range s.Lines {
+		b.WriteString("\n  " + l)
+	}
+	return b.String()
 }
 
 func done(kind, key string, sum contain.Summary) agent.Result {

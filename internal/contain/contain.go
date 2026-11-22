@@ -204,7 +204,7 @@ func (p Pass) Release(ctx context.Context, key string) (Summary, error) {
 	if err != nil {
 		return Summary{Incident: key}, fmt.Errorf("release: read incident %s: %w", key, err)
 	}
-	held, err := p.heldReason(ctx, inc)
+	held, err := HeldReason(ctx, p.Causes, inc)
 	if err != nil {
 		return Summary{Incident: key}, err
 	}
@@ -340,10 +340,11 @@ func addSkip(sum *Summary, record, reason string) {
 	sum.Skipped = append(sum.Skipped, Skip{Record: record, Reason: reason})
 }
 
-// heldReason says why the release must wait, or returns "" when it can go.
-// Only the cause finding that this agent raised counts.
-func (p Pass) heldReason(ctx context.Context, inc incident.Incident) (string, error) {
-	own, err := p.Causes.OwnCause(ctx, inc.Key)
+// HeldReason says why a release must wait, or returns "" when it can go.
+// Only the cause finding that this agent raised counts, and the daemon sets
+// its status.
+func HeldReason(ctx context.Context, causes CauseFinder, inc incident.Incident) (string, error) {
+	own, err := causes.OwnCause(ctx, inc.Key)
 	if err != nil {
 		return "", fmt.Errorf("release: find the cause of this agent: %w", err)
 	}

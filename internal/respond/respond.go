@@ -175,29 +175,52 @@ func New(tools ToolCaller) (*Invoker, error) {
 // when the context ends: the pass then stops. Each other failure is an
 // outcome, so the pass goes on with the next action.
 func (i *Invoker) Invoke(ctx context.Context, a Action) (Result, error) {
-	req, err := structpb.NewStruct(map[string]any{"id": a.ToolID(), "args": a.Args()})
+	c, err := Call(ctx, i.tools, a.ToolID(), a.Args())
 	if err != nil {
-		return Result{}, fmt.Errorf("respond: build the request of %s: %w", a.ToolID(), err)
+		return Result{}, err
+	}
+	res := Result{Action: a, CallID: c.CallID, Outcome: c.Outcome, Detail: c.Detail}
+	if res.Outcome != OutcomeDone {
+		return res, nil
+	}
+	if !confirmed(a.Target.Connector.ID, c.Result) {
+		res.Outcome = OutcomeFailed
+		res.Detail = "the connector answered, and its result does not confirm the action"
+	}
+	return res, nil
+}
+
+// Reply is the answer of one invoke_tool call.
+type Reply struct {
+	// Outcome is done when the daemon passed the call to the connector and
+	// the connector answered. The caller still checks the result.
+	Outcome Outcome
+	// Detail is the cleaned text of the daemon for an outcome that is not done.
+	Detail string
+	// CallID is the id that the daemon recorded for the call, or "".
+	CallID string
+	// Result is the structured content of the tool. It is untrusted data.
+	Result map[string]any
+}
+
+// Call makes one invoke_tool call and classifies its outcome. It returns an
+// error only when the context ends. Each other failure is an outcome.
+func Call(ctx context.Context, tools ToolCaller, toolID string, args map[string]any) (Reply, error) {
+	req, err := structpb.NewStruct(map[string]any{"id": toolID, "args": args})
+	if err != nil {
+		return Reply{}, fmt.Errorf("respond: build the request of %s: %w", toolID, err)
 	}
 	var resp structpb.Struct
 	var callID string
-	err = i.tools.CallToolProto(ctx, InvokeTool, req, &resp, agent.ReceiveToolCallID(&callID))
+	err = tools.CallToolProto(ctx, InvokeTool, req, &resp, agent.ReceiveToolCallID(&callID))
 	if cerr := ctx.Err(); cerr != nil {
-		return Result{}, fmt.Errorf("respond: %s: %w", a.ToolID(), cerr)
+		return Reply{}, fmt.Errorf("respond: %s: %w", toolID, cerr)
 	}
-	res := Result{Action: a, CallID: callID}
 	if err != nil {
-		res.Outcome, res.Detail = Classify(err), Clean(DaemonText(err.Error()))
-		return res, nil
+		return Reply{Outcome: Classify(err), Detail: Clean(DaemonText(err.Error())), CallID: callID}, nil
 	}
 	result, _ := resp.AsMap()["result"].(map[string]any)
-	if !confirmed(a.Target.Connector.ID, result) {
-		res.Outcome = OutcomeFailed
-		res.Detail = "the connector answered, and its result does not confirm the action"
-		return res, nil
-	}
-	res.Outcome = OutcomeDone
-	return res, nil
+	return Reply{Outcome: OutcomeDone, CallID: callID, Result: result}, nil
 }
 
 // vendorMarker starts the part of an error text that the vendor wrote. The

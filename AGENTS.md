@@ -15,6 +15,9 @@ One dispatch is one task on one incident. The task context names both.
 | `cause` | Raises one finding for the cause of the incident and links the Incident to it with `CAUSED_BY`. | `internal/cause` |
 | `release` | Releases each containment that the daemon confirms the agent made, after the cause finding that this agent raised is `verified`. | `internal/contain` |
 
+| `isolate` | Opens and merges a merge request in the GitOps repo of the buyer. It adds a NetworkPolicy that denies all ingress and egress for the labels of one workload, and a lock file. | `internal/isolate` |
+| `release_workload` | After the cause finding that this agent raised is `verified`, opens and merges a merge request that removes both files. | `internal/isolate` |
+
 Each task writes what it did on the Incident node (`internal/emit`).
 
 ## How a response action runs
@@ -69,7 +72,8 @@ Each value from the graph and from a tool result is untrusted data.
 - It never writes the status of a finding.
 - It never reads the health signal of a contained target. A containment stops its target on purpose (ADR-0180).
 - It never releases a containment that the daemon does not confirm it made.
-- It never changes a cluster. The isolation of a Kubernetes workload is a job node with a merge request in the mission, not a task of this agent.
+- It never changes a cluster. It isolates a Kubernetes workload only with a merge request to the GitOps repo of the buyer, through a Git host connector (`internal/isolate`).
+- It never names the cause finding as an input of the isolation merge request. The daemon would link the finding to it and set the status of the finding.
 
 ## Seams that are not built
 
@@ -84,7 +88,8 @@ Each value from the graph and from a tool result is untrusted data.
 | Key | Needed | Meaning |
 |---|---|---|
 | `incident` | yes | The key of the Incident node. |
-| `ir.task` | yes | `contain`, `cause` or `release`. |
+| `ir.task` | yes | `contain`, `cause`, `release`, `isolate` or `release_workload`. |
+| `ir.workload.*`, `ir.gitops.*` | for `isolate` and `release_workload` | The workload and the GitOps repo. The README lists each key. |
 
 The goal is not a fallback for the incident. The goal of a mission node is a sentence for a person, not a key. A dispatch with a missing or unknown key fails the run before any call.
 
