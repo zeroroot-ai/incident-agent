@@ -29,10 +29,10 @@ const (
 // agent, when the dispatch names none.
 const DefaultDir = "zeroroot-containment"
 
-// AdminPriority is the priority of an AdminNetworkPolicy. A lower number is
-// evaluated first. The policy of a cluster admin starts at 0 only by choice,
-// so 1 is ahead of nearly each other policy.
-const AdminPriority = 1
+// ClusterPriority is the priority of a ClusterNetworkPolicy in the Admin
+// tier. A lower number is evaluated first. The policy of a cluster admin
+// starts at 0 only by choice, so 1 is ahead of nearly each other policy.
+const ClusterPriority = 1
 
 // File is one file of a change to the repo of the buyer.
 type File struct {
@@ -166,10 +166,11 @@ func (r Repo) policyYAML(key, ref string, w Workload) string {
 		matchLabels(&b, "    ", w)
 		b.WriteString("  ingressDeny:\n    - fromEntities:\n        - all\n")
 		b.WriteString("  egressDeny:\n    - toEntities:\n        - all\n")
-	case KindAdmin:
-		b.WriteString("apiVersion: policy.networking.k8s.io/v1alpha1\nkind: AdminNetworkPolicy\n")
+	case KindCluster:
+		b.WriteString("apiVersion: policy.networking.k8s.io/v1beta1\nkind: ClusterNetworkPolicy\n")
 		r.meta(&b, key, ref, "")
-		fmt.Fprintf(&b, "spec:\n  priority: %d\n  subject:\n    pods:\n      namespaceSelector:\n", AdminPriority)
+		fmt.Fprintf(&b, "spec:\n  tier: Admin\n  priority: %d\n", ClusterPriority)
+		b.WriteString("  subject:\n    pods:\n      namespaceSelector:\n")
 		fmt.Fprintf(&b, "        matchLabels:\n          kubernetes.io/metadata.name: %s\n", quote(w.Namespace))
 		b.WriteString("      podSelector:\n")
 		matchLabels(&b, "        ", w)

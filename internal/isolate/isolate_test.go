@@ -24,8 +24,19 @@ const incidentKey = "incident-7"
 const gh = "mcp:github-fixloop:"
 
 type mr struct {
-	state, branch string
-	files         []map[string]any
+	state, branch, sha string
+	files              []map[string]any
+}
+
+// sha is the head commit that the mock gives to the nth merge request that it
+// opens.
+func sha(n int) string { return fmt.Sprintf("%040x", n) }
+
+// forge puts a merge request on the host and returns the record value that
+// names it, as a writer of the graph would plant it.
+func forge(g *gitHost, ref, state, branch string) string {
+	g.prs[ref] = &mr{state: state, branch: branch, sha: sha(900)}
+	return ref + "@" + sha(900)
 }
 
 // gitHost is a mock of the Git host behind the connector github-fixloop. It
@@ -52,6 +63,10 @@ type gitHost struct {
 	green bool
 	// denied lists the tool ids that the daemon refuses for the grant.
 	denied map[string]bool
+
+	// beforeMerge runs when the connector gets a merge call, before it checks
+	// the head. A test uses it to push a commit in the gap.
+	beforeMerge func(ref string)
 
 	opened []map[string]any
 	prs    map[string]*mr
@@ -106,12 +121,12 @@ func (g *gitHost) CallToolProto(
 		g.opened = append(g.opened, args)
 		ref = fmt.Sprintf("acme/manifests#%d", len(g.opened))
 		files, _ := args["files"].([]any)
-		m := &mr{state: "open", branch: args["branch"].(string)} //nolint:forcetypeassert // the mock controls the args
+		m := &mr{state: "open", sha: sha(len(g.opened)), branch: args["branch"].(string)} //nolint:forcetypeassert // test
 		for _, f := range files {
 			m.files = append(m.files, f.(map[string]any)) //nolint:forcetypeassert // the mock controls the args
 		}
 		g.prs[ref] = m
-		result = map[string]any{"merge_request": ref}
+		result = map[string]any{"merge_request": ref, "head_sha": g.prs[ref].sha}
 	case isolate.ToolMerge:
 		m, known := g.prs[ref]
 		switch {
@@ -119,6 +134,14 @@ func (g *gitHost) CallToolProto(
 			return errors.New("connector mcp: merge_merge_request on \"x\" reported an error: not found")
 		case m.state == "merged":
 			return errors.New("connector mcp: merge_merge_request on \"x\" reported an error: HTTP 405 already merged")
+		}
+		if g.beforeMerge != nil {
+			g.beforeMerge(ref)
+		}
+		// GitHub refuses the merge with HTTP 409 when the head is not the sha
+		// of the call. The connector then returns merged false.
+		if expected, _ := args["sha"].(string); expected != m.sha {
+			return g.answer(response, map[string]any{"state": m.state, "merged": false})
 		}
 		if g.green {
 			m.state = "merged"
@@ -137,7 +160,7 @@ func (g *gitHost) CallToolProto(
 		if !known {
 			return errors.New("connector mcp: merge_request_state reported an error: not found")
 		}
-		result = map[string]any{"state": m.state, "source_branch": m.branch, "pipeline_green": g.green}
+		result = map[string]any{"state": m.state, "source_branch": m.branch, "head_sha": m.sha, "pipeline_green": g.green}
 	case isolate.ToolClose:
 		if !g.tools {
 			return errors.New("tool not found: " + id)
@@ -154,12 +177,25 @@ func (g *gitHost) CallToolProto(
 	default:
 		g.t.Fatalf("the agent called %s: an isolation never reads a health signal or reverts", id)
 	}
+	return g.answer(response, result)
+}
+
+func (g *gitHost) answer(response proto.Message, result map[string]any) error {
+	g.t.Helper()
 	out, err := structpb.NewStruct(map[string]any{"result": result})
 	if err != nil {
 		g.t.Fatalf("encode: %v", err)
 	}
 	proto.Merge(response, out)
 	return nil
+}
+
+// push adds a commit to the branch of a merge request, as a person with push
+// access does. The head changes, and the new commit holds a file.
+func (g *gitHost) push(ref string) {
+	m := g.prs[ref]
+	m.sha = sha(500 + len(g.calls))
+	m.files = append(m.files, map[string]any{"path": "contain/evil.yaml", "content": "kind: Evil\n"})
 }
 
 // store is the Incident node of a test. It is the recorder and the reader.
@@ -261,7 +297,7 @@ func TestIsolate_OpensAndMergesAndRecords(t *testing.T) {
 		t.Errorf("branch = %v", args["branch"])
 	}
 	ck := repo.Key(incidentKey, w)
-	if got := st.records["ir_isolation_merged_"+ck+"_1"]; got != "acme/manifests#1" {
+	if got := st.records["ir_isolation_merged_"+ck+"_1"]; got != "acme/manifests#1@"+sha(1) {
 		t.Errorf("merged record = %q, records = %v", got, st.records)
 	}
 	for name := range st.records {
@@ -356,8 +392,7 @@ func TestIsolate_ForgedOpenedRecordIsNeverMerged(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			g, st, p := setup(t)
 			w := workload(t)
-			g.prs[tc.ref] = &mr{state: "open", branch: tc.branch}
-			st.records["ir_isolation_opened_"+repo.Key(incidentKey, w)+"_1"] = tc.ref
+			st.records["ir_isolation_opened_"+repo.Key(incidentKey, w)+"_1"] = forge(g, tc.ref, "open", tc.branch)
 			sum, err := p.Isolate(context.Background(), incidentKey, w)
 			if err != nil {
 				t.Fatalf("Isolate: %v", err)
@@ -373,8 +408,8 @@ func TestIsolate_ForgedMergedRecordIsNotTrusted(t *testing.T) {
 	g, st, p := setup(t)
 	w := workload(t)
 	// The host shows a merged merge request on another branch.
-	g.prs["acme/manifests#99"] = &mr{state: "merged", branch: "someone/else"}
-	st.records["ir_isolation_merged_"+repo.Key(incidentKey, w)+"_1"] = "acme/manifests#99"
+	forged := forge(g, "acme/manifests#99", "merged", "someone/else")
+	st.records["ir_isolation_merged_"+repo.Key(incidentKey, w)+"_1"] = forged
 	sum, err := p.Isolate(context.Background(), incidentKey, w)
 	if err != nil || sum.Merged {
 		t.Fatalf("merged = %v, err = %v: %v", sum.Merged, err, sum.Lines)
@@ -384,15 +419,12 @@ func TestIsolate_ForgedMergedRecordIsNotTrusted(t *testing.T) {
 func TestRelease_ForgedRecordsAreNotTrusted(t *testing.T) {
 	for name, set := range map[string]func(g *gitHost, st *store, ck string){
 		"merged record on another branch": func(g *gitHost, st *store, ck string) {
-			g.prs["acme/manifests#99"] = &mr{state: "merged", branch: "someone/else"}
-			st.records["ir_isolation_merged_"+ck+"_1"] = "acme/manifests#99"
+			st.records["ir_isolation_merged_"+ck+"_1"] = forge(g, "acme/manifests#99", "merged", "someone/else")
 		},
 		"release record on another branch": func(g *gitHost, st *store, ck string) {
-			g.prs["acme/manifests#1"] = &mr{state: "merged", branch: isolate.IsolationBranch(ck, 1)}
 			g.base[repo.PolicyPath(ck)] = "x"
-			st.records["ir_isolation_merged_"+ck+"_1"] = "acme/manifests#1"
-			g.prs["acme/manifests#99"] = &mr{state: "open", branch: "attacker/payload"}
-			st.records["ir_release_opened_"+ck+"_1"] = "acme/manifests#99"
+			st.records["ir_isolation_merged_"+ck+"_1"] = forge(g, "acme/manifests#1", "merged", isolate.IsolationBranch(ck, 1))
+			st.records["ir_release_opened_"+ck+"_1"] = forge(g, "acme/manifests#99", "open", "attacker/payload")
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -723,14 +755,125 @@ func TestRepoCheck(t *testing.T) {
 	}
 	for _, r := range []isolate.Repo{
 		ok(func(r *isolate.Repo) { r.Connector = "gitlab-fixloop"; r.Dir = "k8s/prod"; r.Cluster = "eu-1" }),
-		ok(func(r *isolate.Repo) { r.PolicyKind = isolate.KindAdmin }),
+		ok(func(r *isolate.Repo) { r.PolicyKind = isolate.KindCluster }),
 		ok(func(r *isolate.Repo) { r.PolicyKind = isolate.KindNetworkPolicy }),
 	} {
 		if err := r.Check(); err != nil {
 			t.Errorf("Check(%+v) = %v", r, err)
 		}
 	}
-	if !slices.Contains([]string{"cilium", "admin", "networkpolicy"}, isolate.KindCilium) {
+	if !slices.Contains([]string{"cilium", "cluster", "networkpolicy"}, isolate.KindCilium) {
 		t.Fatalf("kind names changed")
+	}
+}
+
+// A record without a head commit is not trusted. A record from before the
+// head commit was recorded has no place in this code path.
+func TestIsolate_RecordWithoutAHeadCommitIsNotTrusted(t *testing.T) {
+	bad := strings.Repeat("g", 40)
+	for _, rec := range []string{"acme/manifests#1", "acme/manifests#1@abc", "acme/manifests#1@" + bad} {
+		g, st, p := setup(t)
+		w := workload(t)
+		branch := isolate.IsolationBranch(repo.Key(incidentKey, w), 1)
+		g.prs["acme/manifests#1"] = &mr{state: "open", branch: branch, sha: sha(1)}
+		st.records["ir_isolation_opened_"+repo.Key(incidentKey, w)+"_1"] = rec
+		sum, err := p.Isolate(context.Background(), incidentKey, w)
+		if err != nil || sum.Merged || g.count(isolate.ToolMerge) != 0 {
+			t.Fatalf("%q: merged = %v, err = %v, calls = %v", rec, sum.Merged, err, g.calls)
+		}
+	}
+}
+
+// Major 2. The branch name does not show a commit that a person adds. The
+// agent records the head commit when it opens the merge request, refuses a
+// merge request whose head differs, and sends the commit to the merge call.
+func TestIsolate_CommitPushedAfterTheOpenIsNeverMerged(t *testing.T) {
+	g, st, p := setup(t)
+	g.green = false // the checks are pending, so the first dispatch leaves the merge request open
+	w := workload(t)
+	if _, err := p.Isolate(context.Background(), incidentKey, w); err != nil {
+		t.Fatalf("first: %v", err)
+	}
+	g.push("acme/manifests#1") // a person with push access adds a commit
+	g.green = true
+	g.calls = nil
+	sum, err := p.Isolate(context.Background(), incidentKey, w)
+	if err != nil {
+		t.Fatalf("second: %v", err)
+	}
+	if sum.Merged || g.count(isolate.ToolMerge) != 0 || g.prs["acme/manifests#1"].state != "open" {
+		t.Fatalf("the agent merged a branch with a commit that it did not open: %v", sum.Lines)
+	}
+	if !strings.Contains(joined(sum), "a commit was added") {
+		t.Errorf("the report does not say why: %v", sum.Lines)
+	}
+	if _, has := g.base["contain/evil.yaml"]; has {
+		t.Errorf("the pushed file is on the base branch")
+	}
+	_ = st
+}
+
+// The commit comes in the gap between the read and the merge call. The agent
+// sends the recorded commit, so the host refuses the merge.
+func TestIsolate_CommitPushedBetweenTheReadAndTheMergeIsRefusedByTheHost(t *testing.T) {
+	g, st, p := setup(t)
+	g.beforeMerge = func(ref string) { g.push(ref) }
+	w := workload(t)
+	sum, err := p.Isolate(context.Background(), incidentKey, w)
+	if err != nil {
+		t.Fatalf("Isolate: %v", err)
+	}
+	if sum.Merged || g.prs["acme/manifests#1"].state != "open" || len(g.base) != 0 {
+		t.Fatalf("merged = %v, state = %q, base = %v: %v", sum.Merged, g.prs["acme/manifests#1"].state, g.base, sum.Lines)
+	}
+	if st.records["ir_isolation_merged_"+repo.Key(incidentKey, w)+"_1"] != "" {
+		t.Fatalf("a refused merge was recorded as merged")
+	}
+}
+
+func TestRelease_CommitPushedToTheReleaseMergeRequestIsNeverMerged(t *testing.T) {
+	g, st, p := setup(t)
+	w := workload(t)
+	if _, err := p.Isolate(context.Background(), incidentKey, w); err != nil {
+		t.Fatalf("Isolate: %v", err)
+	}
+	verify(st)
+	g.green = false
+	if _, err := p.Release(context.Background(), incidentKey, w); err != nil {
+		t.Fatalf("first release: %v", err)
+	}
+	g.push("acme/manifests#2")
+	g.green = true
+	sum, err := p.Release(context.Background(), incidentKey, w)
+	if err != nil || sum.Released || g.prs["acme/manifests#2"].state != "open" {
+		t.Fatalf("released = %v, err = %v: %v", sum.Released, err, sum.Lines)
+	}
+}
+
+// The release merged and the write of the released record failed. The next
+// dispatch must find the release merge request and record a release. It must
+// not record a revert, because the policy is gone from the base branch.
+func TestRelease_LostReleasedRecordIsARelease(t *testing.T) {
+	g, st, p := setup(t)
+	w := workload(t)
+	ck := repo.Key(incidentKey, w)
+	if _, err := p.Isolate(context.Background(), incidentKey, w); err != nil {
+		t.Fatalf("Isolate: %v", err)
+	}
+	verify(st)
+	st.failWrite = "ir_isolation_released_"
+	if _, err := p.Release(context.Background(), incidentKey, w); err == nil {
+		t.Fatalf("the failed write returned no error")
+	}
+	merges := g.count(isolate.ToolMerge)
+	sum, err := p.Release(context.Background(), incidentKey, w)
+	if err != nil || !sum.Released {
+		t.Fatalf("released = %v, err = %v: %v", sum.Released, err, sum.Lines)
+	}
+	if st.records["ir_isolation_released_"+ck+"_1"] == "" || st.records["ir_isolation_reverted_"+ck+"_1"] != "" {
+		t.Fatalf("records = %v: want released and no reverted", st.records)
+	}
+	if g.count(isolate.ToolMerge) != merges {
+		t.Fatalf("the agent merged the release a second time")
 	}
 }

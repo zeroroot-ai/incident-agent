@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/zeroroot-ai/incident-agent/internal/contain"
 	"github.com/zeroroot-ai/incident-agent/internal/emit"
@@ -103,9 +104,31 @@ func generation(inc incident.Incident, key string) int {
 	}
 }
 
+// mrRecord is a merge request that the agent opened: its reference and the
+// head commit that the host returned. The record value is "<ref>@<sha>". The
+// agent trusts the merge request only while its head is that commit. A
+// person with push access can add a commit to the branch, and the branch
+// name alone does not show it.
+type mrRecord struct {
+	Ref, SHA string
+}
+
+func (m mrRecord) String() string { return m.Ref + "@" + m.SHA }
+
+// parseRecord reads a record value. It returns false for a value that is not
+// "<ref>@<sha>".
+func parseRecord(v string) (mrRecord, bool) {
+	i := strings.LastIndex(v, "@")
+	if i < 0 || !shaForm.MatchString(v[i+1:]) {
+		return mrRecord{}, false
+	}
+	return mrRecord{Ref: v[:i], SHA: v[i+1:]}, true
+}
+
 // Isolate isolates the workload with a merged merge request. A record is
 // never enough: the agent reads each merge request on the host and trusts it
-// only on the expected branch in the configured project.
+// only on the expected branch, in the configured project, at the head commit
+// that it recorded.
 func (p Pass) Isolate(ctx context.Context, key string, w Workload) (Summary, error) {
 	if err := p.check(w, false); err != nil {
 		return Summary{}, err
@@ -117,58 +140,86 @@ func (p Pass) Isolate(ctx context.Context, key string, w Workload) (Summary, err
 	ck := p.Repo.Key(key, w)
 	sum := Summary{Incident: key, Key: ck}
 	gen := generation(inc, ck)
-	run := step{p: p, inc: key, key: ck, gen: gen, sum: &sum}
+	run := step{p: p, inc: key, key: ck, gen: gen, w: w, sum: &sum}
 
 	if done := inc.Records[recName(recIsolated, ck, gen)]; done != "" {
-		merged, err := run.verify(ctx, done, IsolationBranch(ck, gen))
-		if err != nil || !merged {
+		again, err := run.confirmIsolation(ctx, done)
+		if err != nil || !again {
 			return sum, err
 		}
-		present, err := run.policyOnBase(ctx, p.Repo.PolicyPath(ck), p.Repo.Isolate(key, w, gen).Files[0].Content)
-		if err != nil {
-			return sum, err
-		}
-		if present != presentGone {
-			sum.Merged, sum.OnBase = true, present == presentYes
-			return sum, nil
-		}
-		// A person or a tool reverted the policy. Close this generation and
-		// isolate again in the next.
-		if err := run.write(ctx, recName(recReverted, ck, gen), done); err != nil {
-			return sum, err
-		}
-		run.say("the policy is not on the base branch any more: it was reverted or edited. " +
-			"The agent isolates again in the next generation")
+		// A person or a tool reverted the policy. The generation is closed.
+		// Isolate again in the next one.
 		gen++
 		run.gen = gen
 		inc.Records = map[string]string{}
 	}
+	return run.isolate(ctx, inc.Records[recName(recIsolationOpened, ck, gen)])
+}
 
-	ref := inc.Records[recName(recIsolationOpened, ck, gen)]
-	if ref == "" {
-		ref, err = run.open(ctx, p.Repo.Isolate(key, w, gen), recName(recIsolationOpened, ck, gen))
-		if err != nil || ref == "" {
-			return sum, err
+// confirmIsolation checks the merged isolation of the generation. It returns
+// true when the policy is gone from the base branch and the generation is
+// closed.
+func (s step) confirmIsolation(ctx context.Context, done string) (bool, error) {
+	m, ok := parseRecord(done)
+	if !ok {
+		s.say("the record " + recName(recIsolated, s.key, s.gen) + " is not trusted: it holds no head commit")
+		return false, nil
+	}
+	merged, err := s.verify(ctx, m, IsolationBranch(s.key, s.gen))
+	if err != nil || !merged {
+		return false, err
+	}
+	present, err := s.policyOnBase(ctx, s.p.Repo.PolicyPath(s.key), s.p.Repo.Isolate(s.inc, s.w, s.gen).Files[0].Content)
+	if err != nil {
+		return false, err
+	}
+	if present != presentGone {
+		s.sum.Merged, s.sum.OnBase = true, present == presentYes
+		return false, nil
+	}
+	if err := s.write(ctx, recName(recReverted, s.key, s.gen), done); err != nil {
+		return false, err
+	}
+	s.say("the policy is not on the base branch any more: it was reverted or edited. " +
+		"The agent isolates again in the next generation")
+	return true, nil
+}
+
+// isolate opens the isolation merge request when the Incident holds none, and
+// merges it.
+func (s step) isolate(ctx context.Context, opened string) (Summary, error) {
+	var m mrRecord
+	if opened == "" {
+		var err error
+		m, err = s.open(ctx, s.p.Repo.Isolate(s.inc, s.w, s.gen), recName(recIsolationOpened, s.key, s.gen))
+		if err != nil || m.Ref == "" {
+			return *s.sum, err
+		}
+	} else {
+		var ok bool
+		if m, ok = parseRecord(opened); !ok {
+			s.say("the record " + recName(recIsolationOpened, s.key, s.gen) + " is not trusted: it holds no head commit")
+			return *s.sum, nil
 		}
 	}
-	merged, err := run.drive(ctx, ref, IsolationBranch(ck, gen))
+	merged, err := s.drive(ctx, m, IsolationBranch(s.key, s.gen))
 	if err != nil || !merged {
-		return sum, err
+		return *s.sum, err
 	}
-	if err := run.write(ctx, recName(recIsolated, ck, gen), ref); err != nil {
-		return sum, err
+	if err := s.write(ctx, recName(recIsolated, s.key, s.gen), m.String()); err != nil {
+		return *s.sum, err
 	}
-	sum.Merged = true
-	present, err := run.policyOnBase(ctx, p.Repo.PolicyPath(ck), p.Repo.Isolate(key, w, gen).Files[0].Content)
+	s.sum.Merged = true
+	present, err := s.policyOnBase(ctx, s.p.Repo.PolicyPath(s.key), s.p.Repo.Isolate(s.inc, s.w, s.gen).Files[0].Content)
 	if err != nil {
-		return sum, err
+		return *s.sum, err
 	}
-	sum.OnBase = present == presentYes
-	if p.Repo.PolicyKind == KindNetworkPolicy {
-		run.say("caution: " + BypassNote)
-		return sum, run.write(ctx, recName(recBypass, ck, gen), BypassNote)
+	s.sum.OnBase = present == presentYes
+	if s.p.Repo.PolicyKind == KindNetworkPolicy {
+		s.say("caution: " + BypassNote)
+		return *s.sum, s.write(ctx, recName(recBypass, s.key, s.gen), BypassNote)
 	}
-	return sum, nil
+	return *s.sum, nil
 }
 
 // Release removes the isolation with a second merged merge request, after the
@@ -196,7 +247,7 @@ func (p Pass) Release(ctx context.Context, key string, w Workload) (Summary, err
 		return sum, nil
 	}
 	gen := generation(inc, ck)
-	run := step{p: p, inc: key, key: ck, gen: gen, sum: &sum}
+	run := step{p: p, inc: key, key: ck, gen: gen, w: w, sum: &sum}
 	isolated, cont, err := run.isolationRef(ctx, inc)
 	if err != nil || !cont {
 		return sum, err
@@ -205,30 +256,41 @@ func (p Pass) Release(ctx context.Context, key string, w Workload) (Summary, err
 	if err != nil || !merged {
 		return sum, err
 	}
-	present, err := run.policyOnBase(ctx, p.Repo.PolicyPath(ck), "")
-	if err != nil {
-		return sum, err
-	}
-	if present == presentGone {
-		run.say("the policy is not on the base branch, so there is nothing to release")
-		return sum, run.write(ctx, recName(recReverted, ck, gen), isolated)
-	}
-	if present == presentUnknown {
-		return sum, nil
-	}
-	ref := inc.Records[recName(recReleaseOpened, ck, gen)]
-	if ref == "" {
-		ref, err = run.open(ctx, p.Repo.Release(key, w, gen), recName(recReleaseOpened, ck, gen))
-		if err != nil || ref == "" {
-			return sum, err
+	return run.release(ctx, isolated, inc.Records[recName(recReleaseOpened, ck, gen)])
+}
+
+// release opens the release merge request and merges it. When the Incident
+// holds the release merge request already, the agent drives that one first:
+// the policy is gone from the base branch after a release that merged and
+// whose record write failed, and that is a release, not a revert.
+func (s step) release(ctx context.Context, isolated mrRecord, opened string) (Summary, error) {
+	var m mrRecord
+	if opened == "" {
+		present, err := s.policyOnBase(ctx, s.p.Repo.PolicyPath(s.key), "")
+		if err != nil || present == presentUnknown {
+			return *s.sum, err
+		}
+		if present == presentGone {
+			s.say("the policy is not on the base branch, so there is nothing to release")
+			return *s.sum, s.write(ctx, recName(recReverted, s.key, s.gen), isolated.String())
+		}
+		m, err = s.open(ctx, s.p.Repo.Release(s.inc, s.w, s.gen), recName(recReleaseOpened, s.key, s.gen))
+		if err != nil || m.Ref == "" {
+			return *s.sum, err
+		}
+	} else {
+		var ok bool
+		if m, ok = parseRecord(opened); !ok {
+			s.say("the record " + recName(recReleaseOpened, s.key, s.gen) + " is not trusted: it holds no head commit")
+			return *s.sum, nil
 		}
 	}
-	merged, err = run.drive(ctx, ref, ReleaseBranch(ck, gen))
+	merged, err := s.drive(ctx, m, ReleaseBranch(s.key, s.gen))
 	if err != nil || !merged {
-		return sum, err
+		return *s.sum, err
 	}
-	sum.Released = true
-	return sum, run.write(ctx, recName(recReleased, ck, gen), ref)
+	s.sum.Released = true
+	return *s.sum, s.write(ctx, recName(recReleased, s.key, s.gen), m.String())
 }
 
 // step runs the calls of one pass and keeps its summary.
@@ -237,7 +299,63 @@ type step struct {
 	inc string
 	key string
 	gen int
+	w   Workload
 	sum *Summary
+}
+
+// isolationRef returns the merge request of the isolation that the release
+// works on, and whether the release goes on.
+func (s step) isolationRef(ctx context.Context, inc incident.Incident) (m mrRecord, cont bool, err error) {
+	isolated := inc.Records[recName(recIsolated, s.key, s.gen)]
+	opened := inc.Records[recName(recIsolationOpened, s.key, s.gen)]
+	switch {
+	case isolated == "" && opened == "":
+		s.say("this agent holds no isolation of the workload to release")
+		return mrRecord{}, false, nil
+	case isolated == "":
+		return s.settleOpen(ctx, opened)
+	}
+	m, ok := parseRecord(isolated)
+	if !ok {
+		s.say("the record " + recName(recIsolated, s.key, s.gen) + " is not trusted: it holds no head commit")
+	}
+	return m, ok, nil
+}
+
+// settleOpen handles an isolation merge request that the agent opened and did
+// not record as merged. A merge request that is still open is closed, so
+// nobody merges it after the release. A merge request that merged is
+// recorded, and the release goes on with it.
+func (s step) settleOpen(ctx context.Context, opened string) (m mrRecord, cont bool, err error) {
+	m, ok := parseRecord(opened)
+	if !ok {
+		s.say("the record " + recName(recIsolationOpened, s.key, s.gen) + " is not trusted: it holds no head commit")
+		return mrRecord{}, false, nil
+	}
+	mr, ok, err := s.read(ctx, m, IsolationBranch(s.key, s.gen))
+	if err != nil || !ok {
+		return mrRecord{}, false, err
+	}
+	switch mr.State {
+	case StateMerged:
+		if err := s.write(ctx, recName(recIsolated, s.key, s.gen), m.String()); err != nil {
+			return mrRecord{}, false, err
+		}
+		return m, true, nil
+	case StateOpen:
+		call, err := s.p.Host.Close(ctx, m.Ref)
+		if err != nil {
+			return mrRecord{}, false, fmt.Errorf("isolate: %w", err)
+		}
+		if s.outcome("close the open isolation merge request "+respond.Clean(m.Ref), call) {
+			return mrRecord{}, false, nil
+		}
+		s.say("closed the isolation merge request " + respond.Clean(m.Ref) + " that never merged")
+	default:
+		s.say("the isolation merge request " + respond.Clean(m.Ref) + " is " + strconv.Quote(respond.Clean(mr.State)) +
+			" and not merged")
+	}
+	return mrRecord{}, false, s.write(ctx, recName(recReleased, s.key, s.gen), m.String())
 }
 
 func (s step) say(line string) { s.sum.Lines = append(s.sum.Lines, line) }
@@ -247,54 +365,6 @@ func (s step) write(ctx context.Context, name, value string) error {
 		return fmt.Errorf("isolate: record %s: %w", name, err)
 	}
 	return nil
-}
-
-// isolationRef returns the merge request of the isolation that the release
-// works on, and whether the release goes on.
-func (s step) isolationRef(ctx context.Context, inc incident.Incident) (ref string, cont bool, err error) {
-	isolated := inc.Records[recName(recIsolated, s.key, s.gen)]
-	opened := inc.Records[recName(recIsolationOpened, s.key, s.gen)]
-	switch {
-	case isolated == "" && opened == "":
-		s.say("this agent holds no isolation of the workload to release")
-		return "", false, nil
-	case isolated == "":
-		return s.settleOpen(ctx, opened, IsolationBranch(s.key, s.gen))
-	default:
-		return isolated, true, nil
-	}
-}
-
-// settleOpen handles an isolation merge request that the agent opened and did
-// not record as merged. A merge request that is still open is closed, so
-// nobody merges it after the release. A merge request that merged is
-// recorded, and the release goes on with it. It returns the merged reference
-// and whether the release goes on.
-func (s step) settleOpen(ctx context.Context, ref, branch string) (merged string, cont bool, err error) {
-	mr, ok, err := s.read(ctx, ref, branch)
-	if err != nil || !ok {
-		return "", false, err
-	}
-	switch mr.State {
-	case StateMerged:
-		if err := s.write(ctx, recName(recIsolated, s.key, s.gen), ref); err != nil {
-			return "", false, err
-		}
-		return ref, true, nil
-	case StateOpen:
-		call, err := s.p.Host.Close(ctx, ref)
-		if err != nil {
-			return "", false, fmt.Errorf("isolate: %w", err)
-		}
-		if s.outcome("close the open isolation merge request "+respond.Clean(ref), call) {
-			return "", false, nil
-		}
-		s.say("closed the isolation merge request " + respond.Clean(ref) + " that never merged")
-	default:
-		s.say("the isolation merge request " + respond.Clean(ref) + " is " + strconv.Quote(respond.Clean(mr.State)) +
-			" and not merged")
-	}
-	return "", false, s.write(ctx, recName(recReleased, s.key, s.gen), ref)
 }
 
 // outcome counts the call. It returns true, and says why, when the call did
@@ -312,95 +382,111 @@ func (s step) outcome(what string, c Call) bool {
 	return true
 }
 
-// open opens the merge request and records its reference at once, so the next
-// dispatch merges it and opens no second one.
-func (s step) open(ctx context.Context, c Change, record string) (string, error) {
-	ref, call, err := s.p.Host.Open(ctx, c)
+// open opens the merge request and records its reference and head commit at
+// once, so the next dispatch merges it and opens no second one.
+func (s step) open(ctx context.Context, c Change, record string) (mrRecord, error) {
+	ref, sha, call, err := s.p.Host.Open(ctx, c)
 	if err != nil {
-		return "", fmt.Errorf("isolate: %w", err)
+		return mrRecord{}, fmt.Errorf("isolate: %w", err)
 	}
 	if s.outcome("open the merge request on branch "+respond.Clean(c.Branch), call) {
-		return "", nil
+		return mrRecord{}, nil
 	}
 	if ref == "" {
 		s.say("open the merge request: the host returned no reference")
-		return "", nil
+		return mrRecord{}, nil
 	}
-	s.say("opened the merge request " + respond.Clean(ref))
-	return ref, s.write(ctx, record, ref)
+	m := mrRecord{Ref: ref, SHA: sha}
+	s.say("opened the merge request " + respond.Clean(ref) + " at the commit " + short(sha))
+	return m, s.write(ctx, record, m.String())
+}
+
+func short(sha string) string {
+	if len(sha) > 12 {
+		return sha[:12]
+	}
+	return sha
 }
 
 // read reads one merge request and refuses it unless it is in the configured
-// project and on the expected branch. A record names the reference, and any
-// writer of the graph can write a record. The host is the fact.
-func (s step) read(ctx context.Context, ref, branch string) (MR, bool, error) {
-	if problem := s.p.Repo.refProblem(ref); problem != "" {
-		s.say("the merge request " + respond.Clean(ref) + " is not trusted: " + problem)
+// project, on the expected branch, and at the head commit that the agent
+// recorded. A record names the reference, and any writer of the graph can
+// write a record. The host is the fact.
+func (s step) read(ctx context.Context, m mrRecord, branch string) (MR, bool, error) {
+	if problem := s.p.Repo.refProblem(m.Ref); problem != "" {
+		s.say("the merge request " + respond.Clean(m.Ref) + " is not trusted: " + problem)
 		return MR{}, false, nil
 	}
-	mr, call, err := s.p.Host.State(ctx, ref)
+	mr, call, err := s.p.Host.State(ctx, m.Ref)
 	if err != nil {
 		return MR{}, false, fmt.Errorf("isolate: %w", err)
 	}
-	if s.outcome("read the state of "+respond.Clean(ref), call) {
+	if s.outcome("read the state of "+respond.Clean(m.Ref), call) {
 		return MR{}, false, nil
 	}
 	if mr.SourceBranch != branch {
-		s.say("the merge request " + respond.Clean(ref) + " is on the branch " +
+		s.say("the merge request " + respond.Clean(m.Ref) + " is on the branch " +
 			strconv.Quote(respond.Clean(mr.SourceBranch)) + " and the expected branch is " +
 			strconv.Quote(branch) + ": it is not trusted")
+		return MR{}, false, nil
+	}
+	if mr.HeadSHA != m.SHA {
+		s.say("the head of " + respond.Clean(m.Ref) + " is the commit " + short(respond.Clean(mr.HeadSHA)) +
+			" and the agent opened it at " + short(m.SHA) + ": a commit was added after the agent opened it, " +
+			"so it is not trusted")
 		return MR{}, false, nil
 	}
 	return mr, true, nil
 }
 
 // verify reports whether the host shows the merge request merged.
-func (s step) verify(ctx context.Context, ref, branch string) (bool, error) {
-	mr, ok, err := s.read(ctx, ref, branch)
+func (s step) verify(ctx context.Context, m mrRecord, branch string) (bool, error) {
+	mr, ok, err := s.read(ctx, m, branch)
 	if err != nil || !ok {
 		return false, err
 	}
 	if mr.State != StateMerged {
-		s.say("the host shows " + respond.Clean(ref) + " in the state " + strconv.Quote(respond.Clean(mr.State)) +
+		s.say("the host shows " + respond.Clean(m.Ref) + " in the state " + strconv.Quote(respond.Clean(mr.State)) +
 			" and not merged")
 		return false, nil
 	}
-	s.say(respond.Clean(ref) + " is merged")
+	s.say(respond.Clean(m.Ref) + " is merged")
 	return true, nil
 }
 
 // drive brings the merge request to the merged state. It reads the state
 // before it merges, so a merge request that merged already gets no second
-// merge call, which the host refuses. It reads the state again after the
-// merge call.
-func (s step) drive(ctx context.Context, ref, branch string) (bool, error) {
-	mr, ok, err := s.read(ctx, ref, branch)
+// merge call, which the host refuses. The merge call carries the recorded
+// head commit, so the host refuses the merge when a commit came after the
+// read. It reads the state again after the merge call.
+func (s step) drive(ctx context.Context, m mrRecord, branch string) (bool, error) {
+	mr, ok, err := s.read(ctx, m, branch)
 	if err != nil || !ok {
 		return false, err
 	}
 	switch mr.State {
 	case StateMerged:
-		s.say(respond.Clean(ref) + " is merged already: no merge call")
+		s.say(respond.Clean(m.Ref) + " is merged already: no merge call")
 		return true, nil
 	case StateOpen:
 	default:
-		s.say("the host shows " + respond.Clean(ref) + " in the state " + strconv.Quote(respond.Clean(mr.State)) +
+		s.say("the host shows " + respond.Clean(m.Ref) + " in the state " + strconv.Quote(respond.Clean(mr.State)) +
 			": a person must decide")
 		return false, nil
 	}
-	merged, call, err := s.p.Host.Merge(ctx, ref)
+	merged, call, err := s.p.Host.Merge(ctx, m.Ref, m.SHA)
 	if err != nil {
 		return false, fmt.Errorf("isolate: %w", err)
 	}
-	if s.outcome("merge "+respond.Clean(ref), call) {
+	if s.outcome("merge "+respond.Clean(m.Ref), call) {
 		return false, nil
 	}
 	if !merged {
-		s.say("the host did not merge " + respond.Clean(ref) + ": the checks are not done or a rule blocks it. " +
-			"The next dispatch merges it again")
+		s.say("the host did not merge " + respond.Clean(m.Ref) + " at the commit " + short(m.SHA) +
+			": the checks are not done, a rule blocks it, or the head moved. The next dispatch reads it again")
 		return false, nil
 	}
-	return s.verify(ctx, ref, branch)
+	return s.verify(ctx, m, branch)
 }
 
 // The answers of policyOnBase.

@@ -46,7 +46,7 @@ func (g *gitPlatform) CallToolProto(
 			m := f.(map[string]any)                                //nolint:forcetypeassert // the test controls the args
 			g.files[m["path"].(string)], _ = m["content"].(string) //nolint:forcetypeassert // the test controls the args
 		}
-		result = map[string]any{"merge_request": "acme/manifests!4"}
+		result = map[string]any{"merge_request": "acme/manifests!4", "head_sha": headSHA}
 	case "mcp:gitlab-fixloop:merge_merge_request":
 		g.merged = true
 		result = map[string]any{"state": "merged", "merged": true}
@@ -55,7 +55,7 @@ func (g *gitPlatform) CallToolProto(
 		if g.merged {
 			state = "merged"
 		}
-		result = map[string]any{"state": state, "source_branch": g.branch}
+		result = map[string]any{"state": state, "source_branch": g.branch, "head_sha": headSHA}
 	case "mcp:gitlab-fixloop:read_file":
 		c, found := g.files[args["path"].(string)] //nolint:forcetypeassert // the test controls the args
 		result = map[string]any{"found": found, "content": c}
@@ -86,6 +86,8 @@ func (g *gitPlatform) Observe(_ context.Context, obs agent.Observation) error {
 }
 
 func (*gitPlatform) Model(context.Context, string) (*openresponses.Client, error) { return nil, nil }
+
+const headSHA = "0123456789abcdef0123456789abcdef01234567"
 
 type liveReader struct{ g *gitPlatform }
 

@@ -50,7 +50,7 @@ func TestPolicyYAML(t *testing.T) {
 	w := workload(t)
 	checks := map[string]func(*testing.T, map[string]any, string) map[string]any{
 		isolate.KindCilium:        checkCilium,
-		isolate.KindAdmin:         checkAdmin,
+		isolate.KindCluster:       checkCluster,
 		isolate.KindNetworkPolicy: checkNetworkPolicy,
 	}
 	for kind, check := range checks {
@@ -92,15 +92,17 @@ func checkCilium(t *testing.T, policy map[string]any, _ string) map[string]any {
 	return selector(t, policy, "spec", "endpointSelector", "matchLabels")
 }
 
-func checkAdmin(t *testing.T, policy map[string]any, text string) map[string]any {
+func checkCluster(t *testing.T, policy map[string]any, text string) map[string]any {
 	t.Helper()
-	if at(t, policy, "kind") != "AdminNetworkPolicy" {
+	if at(t, policy, "kind") != "ClusterNetworkPolicy" ||
+		at(t, policy, "apiVersion") != "policy.networking.k8s.io/v1beta1" ||
+		at(t, policy, "spec", "tier") != "Admin" {
 		t.Errorf("policy = %v", policy)
 	}
 	if _, has := at(t, policy, "metadata").(map[string]any)["namespace"]; has {
-		t.Errorf("an AdminNetworkPolicy is cluster scoped")
+		t.Errorf("a ClusterNetworkPolicy is cluster scoped")
 	}
-	if at(t, policy, "spec", "priority") != isolate.AdminPriority {
+	if at(t, policy, "spec", "priority") != isolate.ClusterPriority {
 		t.Errorf("priority = %v", at(t, policy, "spec", "priority"))
 	}
 	ns := selector(t, policy, "spec", "subject", "pods", "namespaceSelector", "matchLabels")

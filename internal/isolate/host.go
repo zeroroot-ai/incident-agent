@@ -52,9 +52,11 @@ const (
 	// KindCilium is a CiliumNetworkPolicy with egressDeny and ingressDeny.
 	// A deny rule wins over each allow rule of Cilium.
 	KindCilium = "cilium"
-	// KindAdmin is an AdminNetworkPolicy with the action Deny at a high
-	// priority. It is evaluated before each NetworkPolicy.
-	KindAdmin = "admin"
+	// KindCluster is a ClusterNetworkPolicy of the tier Admin with the action
+	// Deny (policy.networking.k8s.io/v1beta1). The Admin tier is evaluated
+	// before each NetworkPolicy. The Kubernetes network policy API replaced
+	// AdminNetworkPolicy with it in v0.2.0.
+	KindCluster = "cluster"
 	// KindNetworkPolicy is a NetworkPolicy. Policies add up, so another
 	// policy that allows traffic still allows it. See BypassNote.
 	KindNetworkPolicy = "networkpolicy"
@@ -64,12 +66,16 @@ const (
 // NetworkPolicy isolation.
 const BypassNote = "NetworkPolicy objects add up, so another policy that allows traffic still allows it. " +
 	"A CNI that does not enforce policy, and a pod with hostNetwork, bypass it. " +
-	"Use the policy kind cilium or admin to get a deny that wins."
+	"Use the policy kind cilium or cluster to get a deny that wins."
 
 // defaultControllerNamespaces hold the GitOps controller of the buyer. A
 // policy that denies all traffic there stops the controller, so it can no
 // longer apply the release. The dispatch can name more.
 var defaultControllerNamespaces = []string{"argocd", "flux-system"}
+
+// shaForm is a git commit id: 40 hexadecimal characters, or 64 for a
+// repository with SHA-256 object ids.
+var shaForm = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64})$`)
 
 // dirPart is one segment of the directory or of the cluster name.
 var dirPart = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
@@ -88,7 +94,7 @@ type Repo struct {
 	// Cluster names the cluster when one repo serves many clusters. The files
 	// go in Dir/Cluster. It can be empty.
 	Cluster string
-	// PolicyKind is one of KindCilium, KindAdmin and KindNetworkPolicy.
+	// PolicyKind is one of KindCilium, KindCluster and KindNetworkPolicy.
 	PolicyKind string
 	// ControllerNamespaces are namespaces of the GitOps controller, besides
 	// the defaults. The agent never isolates a workload in them.
@@ -113,10 +119,10 @@ func (r Repo) Check() error {
 		return errors.New("isolate: the cluster name must be one path segment of a-z, 0-9, dot, underscore and dash")
 	}
 	switch r.PolicyKind {
-	case KindCilium, KindAdmin, KindNetworkPolicy:
+	case KindCilium, KindCluster, KindNetworkPolicy:
 	default:
 		return fmt.Errorf("isolate: the policy kind %q is not %s, %s or %s",
-			respond.Clean(r.PolicyKind), KindCilium, KindAdmin, KindNetworkPolicy)
+			respond.Clean(r.PolicyKind), KindCilium, KindCluster, KindNetworkPolicy)
 	}
 	return nil
 }
@@ -195,16 +201,23 @@ type MR struct {
 	// SourceBranch is the branch of the merge request. The connector omits
 	// it for a merge request from a fork.
 	SourceBranch string
+	// HeadSHA is the head commit of the branch. A person with push access can
+	// add a commit to the branch, so the agent compares it with the commit
+	// that it recorded when it opened the merge request.
+	HeadSHA string
 }
 
 // Host is the Git host of the buyer, reached through the connector.
 type Host interface {
-	// Open opens the merge request of the change and returns its reference.
-	Open(ctx context.Context, c Change) (ref string, call Call, err error)
+	// Open opens the merge request of the change and returns its reference
+	// and the head commit of its branch.
+	Open(ctx context.Context, c Change) (ref, sha string, call Call, err error)
 	// State reads one merge request on the host.
 	State(ctx context.Context, ref string) (mr MR, call Call, err error)
-	// Merge merges the merge request. It returns whether the host merged it.
-	Merge(ctx context.Context, ref string) (merged bool, call Call, err error)
+	// Merge merges the merge request at the expected head commit. The host
+	// refuses the merge when the head moved. It returns whether the host
+	// merged it.
+	Merge(ctx context.Context, ref, sha string) (merged bool, call Call, err error)
 	// Close closes the merge request without a merge.
 	Close(ctx context.Context, ref string) (call Call, err error)
 	// ReadFile reads one file on the base branch.
@@ -241,7 +254,7 @@ func (h *ToolHost) call(ctx context.Context, tool string, args map[string]any) (
 
 // Open implements Host. The result must name a merge request of the
 // configured project, because the agent sends the reference back.
-func (h *ToolHost) Open(ctx context.Context, c Change) (string, Call, error) {
+func (h *ToolHost) Open(ctx context.Context, c Change) (ref, sha string, call Call, err error) {
 	files := make([]any, 0, len(c.Files))
 	for _, f := range c.Files {
 		entry := map[string]any{"path": f.Path}
@@ -257,13 +270,17 @@ func (h *ToolHost) Open(ctx context.Context, c Change) (string, Call, error) {
 		"title": c.Title, "description": c.Description, "files": files,
 	})
 	if err != nil || !call.Done() {
-		return "", call, err
+		return "", "", call, err
 	}
-	ref, _ := r.Result["merge_request"].(string)
+	ref, _ = r.Result["merge_request"].(string)
 	if problem := h.repo.refProblem(ref); problem != "" {
-		return "", Call{Outcome: respond.OutcomeFailed, Detail: problem}, nil
+		return "", "", Call{Outcome: respond.OutcomeFailed, Detail: problem}, nil
 	}
-	return ref, call, nil
+	sha, _ = r.Result["head_sha"].(string)
+	if !shaForm.MatchString(sha) {
+		return "", "", Call{Outcome: respond.OutcomeFailed, Detail: "the connector returned no head commit"}, nil
+	}
+	return ref, sha, call, nil
 }
 
 // State implements Host.
@@ -274,13 +291,14 @@ func (h *ToolHost) State(ctx context.Context, ref string) (MR, Call, error) {
 	}
 	state, _ := r.Result["state"].(string)
 	branch, _ := r.Result["source_branch"].(string)
-	return MR{State: state, SourceBranch: branch}, call, nil
+	sha, _ := r.Result["head_sha"].(string)
+	return MR{State: state, SourceBranch: branch, HeadSHA: sha}, call, nil
 }
 
 // Merge implements Host. The connector merges only when the checks passed
 // and the daemon grants the merge. The result says whether it merged.
-func (h *ToolHost) Merge(ctx context.Context, ref string) (bool, Call, error) {
-	r, call, err := h.call(ctx, ToolMerge, map[string]any{"merge_request": ref})
+func (h *ToolHost) Merge(ctx context.Context, ref, sha string) (bool, Call, error) {
+	r, call, err := h.call(ctx, ToolMerge, map[string]any{"merge_request": ref, "sha": sha})
 	if err != nil || !call.Done() {
 		return false, call, err
 	}

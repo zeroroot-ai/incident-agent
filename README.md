@@ -39,7 +39,7 @@ These items need a change in another repo.
 
 9. **Isolate a Kubernetes workload** (gibson#1477). The agent builds the merge requests. Parts are missing in other repos. See the section "Isolate a Kubernetes workload".
 
-10. **The binding of a cause finding to this agent** (gibson). The release and the release of a workload trust only a finding that carries the author and the two tags of this agent. The daemon drops both. So each release waits until the daemon keeps them.
+10. **The binding of a cause finding to this agent** (gibson). The release and the release of a workload trust only a finding that carries the author and the two tags of this agent. The daemon drops both. So each release waits until the daemon keeps them. This includes the existing `release` task, which now waits too.
 
 ## Isolate a Kubernetes workload
 
@@ -59,14 +59,14 @@ Policies of the kind NetworkPolicy add up. A deny-all NetworkPolicy does not blo
 | `ir.gitops.policy_kind` | Object | Deny wins over an allow |
 |---|---|---|
 | `cilium` | `CiliumNetworkPolicy` with `ingressDeny` and `egressDeny` for all entities. See https://docs.cilium.io/en/stable/security/policy/language/ | Yes |
-| `admin` | `AdminNetworkPolicy` with the action `Deny` at the priority 1, in the namespace of the workload. It covers ingress from pods in the cluster, and egress to the cluster and to `0.0.0.0/0` and `::/0`. See https://network-policy-api.sigs.k8s.io/ | Yes |
+| `cluster` | `ClusterNetworkPolicy` of the tier `Admin` with the action `Deny` at the priority 1 (`policy.networking.k8s.io/v1beta1`). The object is cluster-scoped, so it has no namespace. Its subject selects the namespace of the workload with the label `kubernetes.io/metadata.name`, and the pods by their labels. The ingress peer is every namespace. The egress peers are every namespace and the networks `0.0.0.0/0` and `::/0`. An ingress peer is a namespace or a pod, so traffic from outside the cluster into the pod is not in its scope. The Admin tier is evaluated before each NetworkPolicy. It replaced `AdminNetworkPolicy` in network-policy-api v0.2.0. See https://network-policy-api.sigs.k8s.io/ and https://github.com/kubernetes-sigs/network-policy-api/blob/v0.3.1/config/crd/standard/policy.networking.k8s.io_clusternetworkpolicies.yaml | Yes |
 | `networkpolicy` | `NetworkPolicy` with `Ingress` and `Egress` and no rule. See https://kubernetes.io/docs/concepts/services-networking/network-policies/ | No |
 
 For `networkpolicy`, the agent still writes the policy. The report and the record `ir_isolation_bypass_<key>_<generation>` say that another allow policy, a CNI that does not enforce policy, and a pod with `hostNetwork` can bypass it.
 
 ### What the agent does not trust
 
-- **A record.** Any writer of the graph can write a record. So the agent reads each merge request on the host before it merges or counts it. It trusts a merge request only when its reference is in the configured project (`<project>#<number>` or `<project>!<number>`) and its source branch is the expected branch `zeroroot/isolate-<key>-<generation>` or `zeroroot/release-<key>-<generation>`. A URL, another project and another branch get no call.
+- **A record.** Any writer of the graph can write a record. So the agent reads each merge request on the host before it merges or counts it. It trusts a merge request only when its reference is in the configured project (`<project>#<number>` or `<project>!<number>`), its source branch is the expected branch `zeroroot/isolate-<key>-<generation>` or `zeroroot/release-<key>-<generation>`, and its head commit is the commit that the host returned when the agent opened it. A URL, another project, another branch and a moved head get no call. A person with push access can add a commit to the branch, and the branch name alone does not show it. The record value is `<reference>@<head sha>`. The agent sends that sha to `merge_merge_request`, so the host refuses the merge when the head moved after the read.
 - **A merge.** A merge is not an application. The GitOps controller of the buyer applies the policy, and the agent does not see that. The report says "merged". It never says "isolated". After the merge, the agent reads the policy file on the base branch. When a person or a tool reverted or edited the policy, the agent records `ir_isolation_reverted_<key>_<generation>` and isolates again in the next generation.
 - **The namespace of the GitOps controller.** The agent refuses `argocd`, `flux-system`, and each namespace in `ir.gitops.controller_namespaces`. A deny-all policy there stops the controller, and the release could not apply.
 - **The cause finding.** The release takes a cause finding only when its author and its two tags name this agent. A title prefix and a category are text that any writer of the mission can copy. The daemon drops the author and the tags today, so a release waits (open item 10).
@@ -84,25 +84,26 @@ The mission node gives these keys. All are required except the last three.
 | `ir.gitops.connector` | `github-fixloop` or `gitlab-fixloop`. |
 | `ir.gitops.project` | The project of the GitOps repo, for example `acme/manifests`. |
 | `ir.gitops.base_branch` | The branch of the merge request target. |
-| `ir.gitops.policy_kind` | `cilium`, `admin` or `networkpolicy`. |
+| `ir.gitops.policy_kind` | `cilium`, `cluster` or `networkpolicy`. |
 | `ir.gitops.dir` | The directory for the files. The default is `zeroroot-containment`. It holds only `a-z`, `0-9`, `.`, `_`, `-` and `/`. No segment starts with a dot or a dash, so the agent never writes under `.github`. |
 | `ir.gitops.cluster` | The cluster name, when one repo serves many clusters. The files go in `<dir>/<cluster>`, and the key of the containment holds the cluster. |
 | `ir.gitops.controller_namespaces` | More namespaces of the GitOps controller, separated by commas. |
 
 **Limit: the source of the labels.** No mission in `gibson` sets `ir.workload.labels` today. The mission `incident-response` (commit 15c3bd4c) is removed from the catalog, and it never set the workload keys. If a later mission copies the labels from an alert, the labels are data from a security tool and not an instruction. A forged alert could then choose which workload the agent isolates. The mission must take the workload from a source that the buyer controls. The agent checks only the form of each label.
 
-The records on the Incident are `ir_isolation_opened_`, `ir_isolation_merged_`, `ir_release_opened_`, `ir_isolation_released_`, `ir_isolation_reverted_` and `ir_isolation_bypass_`, each with the key of the containment and a generation. The value is the merge request reference. The agent writes the opened record at once. So a dispatch after a pending merge merges the same merge request and opens no second one. The release closes an isolation merge request that never merged, so nobody merges it later.
+The records on the Incident are `ir_isolation_opened_`, `ir_isolation_merged_`, `ir_release_opened_`, `ir_isolation_released_`, `ir_isolation_reverted_` and `ir_isolation_bypass_`, each with the key of the containment and a generation. The value is the merge request reference. The agent writes the opened record at once. So a dispatch after a pending merge merges the same merge request and opens no second one. The release closes an isolation merge request that never merged, so nobody merges it later. A release that merged and whose record write failed is found again through the record `ir_release_opened_`, and the agent records a release and not a revert.
 
 ### The tools
 
 | Tool | State | Source |
 |---|---|---|
-| `merge_request_state`, `merge_merge_request` | Exist in `github-fixloop` and `gitlab-fixloop` v0.2.0. `merge_request_state` returns `source_branch`. | `zeroroot-ai/connectors` |
+| `merge_request_state`, `merge_merge_request` | Exist in `github-fixloop` and `gitlab-fixloop` v0.2.0. `merge_request_state` returns `source_branch`. It must also return `head_sha`, and `merge_merge_request` must take the input `sha` and refuse the merge when the head differs. GitHub and GitLab both accept a sha on merge. | `zeroroot-ai/connectors` |
 | `open_merge_request`, `close_merge_request`, `read_file` | Do not exist. A call fails with a daemon refusal and changes nothing. | Contract below |
 
 The contract, for `zeroroot-ai/connectors`.
 
-- `open_merge_request` takes `project`, `base_branch`, `branch`, `title`, `description` and `files`. Each file has a `path`, and either `content` or `delete: true`. The tool writes a `content` file whether it exists or not. The result is `{"merge_request": "<project>#<number>"}` for GitHub and `<project>!<number>` for GitLab. The same `branch` called two times opens one merge request. The tool commits all files in one commit.
+- `open_merge_request` takes `project`, `base_branch`, `branch`, `title`, `description` and `files`. Each file has a `path`, and either `content` or `delete: true`. The tool writes a `content` file whether it exists or not. The result is `{"merge_request": "<project>#<number>", "head_sha": "<commit>"}` for GitHub, and `<project>!<number>` for GitLab. `head_sha` is the head commit of the new branch. The same `branch` called two times opens one merge request. The tool commits all files in one commit.
+- `merge_request_state` adds the result field `head_sha`. `merge_merge_request` takes the input `sha`. When the head of the merge request is another commit, it merges nothing and returns `merged: false`.
 - `close_merge_request` takes `merge_request` and closes it without a merge.
 - `read_file` takes `project`, `ref` and `path`. The result is `{"found": <bool>, "content": "<text>"}`. A result with no `found` is a failure.
 
