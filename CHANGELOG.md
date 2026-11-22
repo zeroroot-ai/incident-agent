@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/zeroroot-ai/incident-agent/compare/v0.1.0...v0.2.0) (2026-11-22)
+
+
+### Features
+
+* **isolate:** isolate a Kubernetes workload and release it by merge request ([#8](https://github.com/zeroroot-ai/incident-agent/issues/8)) ([44ebed5](https://github.com/zeroroot-ai/incident-agent/commit/44ebed5986a206e79ecd0e311f23e15449207f34))
+
 ## 0.1.0 (2026-11-21)
 
 
