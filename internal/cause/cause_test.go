@@ -293,3 +293,35 @@ func TestSeverity(t *testing.T) {
 		t.Errorf("unknown: %s", got)
 	}
 }
+
+// The release trusts a cause only when the author and the tags bind it to this
+// agent. The title prefix and the category are text that any writer of the
+// mission can copy.
+func TestFinder_BoundTakesOnlyAFindingThatCarriesTheAuthorAndTheTags(t *testing.T) {
+	title := cause.Prefix("inc-1") + "x"
+	bound := &finding.Finding{
+		ID: "bound", Title: title, Category: cause.Category, AgentName: cause.AgentName,
+		Tags: []string{cause.AgentName, "incident:" + cause.Ref("inc-1")},
+	}
+	copied := &finding.Finding{ID: "copied", Title: title, Category: cause.Category}
+	for name, tc := range map[string]struct {
+		stored []*finding.Finding
+		bound  bool
+		want   string
+	}{
+		"a copied title is taken when the finder is not bound": {[]*finding.Finding{copied}, false, "copied"},
+		"a copied title is refused when the finder is bound":   {[]*finding.Finding{copied}, true, ""},
+		"the bound finding wins over a copy":                   {[]*finding.Finding{copied, bound}, true, "bound"},
+		"a bound finding with one tag only is refused": {[]*finding.Finding{{
+			ID: "half", Title: title, Category: cause.Category, AgentName: cause.AgentName, Tags: []string{cause.AgentName},
+		}}, true, ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := cause.Finder{Bound: tc.bound, Findings: &fakeFindings{keepAuthor: true, stored: tc.stored}}
+			got, err := f.OwnCause(context.Background(), "inc-1")
+			if err != nil || got != tc.want {
+				t.Fatalf("OwnCause = %q, %v, want %q", got, err, tc.want)
+			}
+		})
+	}
+}

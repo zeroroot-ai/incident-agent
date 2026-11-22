@@ -1,0 +1,17 @@
+The files in this directory are upstream schemas. The tests render each policy kind
+and validate it against the schema of its upstream API.
+
+clusternetworkpolicies.v0.3.1.yaml
+  The CRD of ClusterNetworkPolicy, standard channel, bundle v0.3.1. It serves v1alpha2 and v1beta1.
+  https://raw.githubusercontent.com/kubernetes-sigs/network-policy-api/v0.3.1/config/crd/standard/policy.networking.k8s.io_clusternetworkpolicies.yaml
+  sha256 865bc83dbc94c9c46e22c3c27657c8a2833812fdd5aa0f765f990ef39912db60
+
+ciliumnetworkpolicies.v1.19.11.yaml
+  The CRD of CiliumNetworkPolicy, Cilium v1.19.11.
+  https://raw.githubusercontent.com/cilium/cilium/v1.19.11/pkg/k8s/apis/cilium.io/client/crds/v2/ciliumnetworkpolicies.yaml
+  sha256 1b1738a904de1152c43078e6a873440aea100f30f10ce5ed4e8622524c13fa43
+
+networkpolicy.v1.36.6.schema.json
+  The schemas that NetworkPolicy needs, from the OpenAPI v3 document of networking.k8s.io/v1 in Kubernetes v1.36.6.
+  https://raw.githubusercontent.com/kubernetes/kubernetes/v1.36.6/api/openapi-spec/v3/apis__networking.k8s.io__v1_openapi.json
+  The file keeps NetworkPolicy and the schemas that it refers to, and drops each description. It changes nothing else.

@@ -65,6 +65,10 @@ type daemon struct {
 	calls    []string
 	recorded map[string]recordedCall
 	findings []*typespb.Finding
+	// bind makes the daemon keep the author and the tags of a finding. The
+	// daemon of gibson drops both today (protoFindingToFinding and
+	// agentFindingToProto). A test that needs a bound cause sets it.
+	bind     bool
 	observed []*harnesspb.LifecycleEntityObservation
 }
 
@@ -167,7 +171,7 @@ func (d *daemon) SubmitFinding(
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	f := req.GetFinding()
-	d.findings = append(d.findings, &typespb.Finding{
+	pf := &typespb.Finding{
 		// The daemon never reads the id of the payload.
 		Id:          fmt.Sprintf("0f1d3c2a-0000-4000-8000-%012d", len(d.findings)+1),
 		Title:       f.GetTitle(),
@@ -175,7 +179,11 @@ func (d *daemon) SubmitFinding(
 		Category:    f.GetCategory(),
 		Confidence:  f.GetConfidence(),
 		Severity:    f.GetSeverity(),
-	})
+	}
+	if d.bind {
+		pf.AgentName, pf.Tags = f.GetAgentName(), f.GetTags()
+	}
+	d.findings = append(d.findings, pf)
 	return &harnesspb.SubmitFindingResponse{}, nil
 }
 
@@ -389,7 +397,7 @@ func TestRun_CauseRaisesOneFindingAndLinksItWithCausedBy(t *testing.T) {
 }
 
 func TestRun_ReleaseWaitsForVerifiedAndThenUndoesWhatItMade(t *testing.T) {
-	d := &daemon{}
+	d := &daemon{bind: true}
 	p := start(t, d)
 	p.answer = answer
 	inc := theIncident()
@@ -428,7 +436,7 @@ func TestRun_ReleaseWaitsForVerifiedAndThenUndoesWhatItMade(t *testing.T) {
 // Another writer links its own verified finding as a cause and writes
 // contained records with ids of its choice. The release accepts neither.
 func TestRun_ReleaseIgnoresTheCausesAndRecordsOfAnotherWriter(t *testing.T) {
-	d := &daemon{}
+	d := &daemon{bind: true}
 	p := start(t, d)
 	okta := target(t, "Account", "okta-response", oktaID)
 	host := target(t, "Host", "crowdstrike-response", falconID)
@@ -527,4 +535,31 @@ func target(t *testing.T, label, connectorID, vendorID string) respond.Target {
 // composite key of the identity properties connector and vendor_id.
 func placeKey(connectorID, vendorID string) string {
 	return "connector=" + connectorID + "|vendor_id=" + vendorID
+}
+
+// The daemon drops the author and the tags of a finding. A title prefix and a
+// category are text that any writer of the mission can copy, so the release
+// does not trust them alone: it holds each containment.
+func TestRun_ReleaseHoldsWhenTheDaemonDoesNotBindTheCauseToThisAgent(t *testing.T) {
+	d := &daemon{}
+	p := start(t, d)
+	p.answer = answer
+	r := reader{inc: theIncident(), d: d}
+	if _, err := pass.Run(context.Background(), p, r, checker{d}, task("contain")); err != nil {
+		t.Fatal(err)
+	}
+	res, err := pass.Run(context.Background(), p, r, checker{d}, task("cause"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	causeID, _ := res.Metadata["cause"].(string)
+	r.inc.Causes = []incident.Cause{{FindingID: causeID, Status: "verified"}}
+	d.calls = nil
+	res, err = pass.Run(context.Background(), p, r, checker{d}, task("release"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(d.calls) != 0 || !strings.Contains(res.Output.(string), "no cause finding is proven to be of this agent") {
+		t.Fatalf("calls %v, output %q: a verified finding with no author released a containment", d.calls, res.Output)
+	}
 }

@@ -173,6 +173,15 @@ func (e *Emitter) Record(ctx context.Context, incidentKey string, r respond.Resu
 	return e.observe(ctx, incidentObservation(incidentKey, map[string]string{n: value}, nil))
 }
 
+// RecordValue writes one record of a name and a value on the Incident node.
+// The name must match RecordNamePattern.
+func (e *Emitter) RecordValue(ctx context.Context, incidentKey, recName, value string) error {
+	if err := checkName(recName); err != nil {
+		return err
+	}
+	return e.observe(ctx, incidentObservation(incidentKey, map[string]string{recName: respond.Clean(value)}, nil))
+}
+
 // Held writes why the release step released nothing.
 func (e *Emitter) Held(ctx context.Context, incidentKey, reason string) error {
 	if err := checkName(RecordHeld); err != nil {

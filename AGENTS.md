@@ -14,6 +14,8 @@ One dispatch is one task on one incident. The task context names both.
 | `contain` | Reads the incident and its records. Skips each target that the agent contained already. Makes each other containment action one time: revoke the sessions of an identity, disable an account, isolate a host. | `internal/contain`, `internal/respond` |
 | `cause` | Raises one finding for the cause of the incident and links the Incident to it with `CAUSED_BY`. | `internal/cause` |
 | `release` | Releases each containment that the daemon confirms the agent made, after the cause finding that this agent raised is `verified`. | `internal/contain` |
+| `isolate` | Opens and merges a merge request in the GitOps repo of the buyer. It adds a policy of the kind that the dispatch names (`cilium`, `cluster` or `networkpolicy`) that denies ingress and egress for the labels of one workload as far as the kind can express (the kinds `cluster` and `networkpolicy` have gaps, and the report and an Incident record state them), and a lock file. It merges a merge request only when it is in the configured project, on the expected branch, at the head commit that the host returned, and when its changed files equal the change that the agent wrote. | `internal/isolate` |
+| `release_workload` | After the cause finding that this agent raised is `verified` and that carries its author and tags, opens and merges a merge request that removes both files. It closes an isolation merge request that never merged. | `internal/isolate` |
 
 Each task writes what it did on the Incident node (`internal/emit`).
 
@@ -69,7 +71,8 @@ Each value from the graph and from a tool result is untrusted data.
 - It never writes the status of a finding.
 - It never reads the health signal of a contained target. A containment stops its target on purpose (ADR-0180).
 - It never releases a containment that the daemon does not confirm it made.
-- It never changes a cluster. The isolation of a Kubernetes workload is a job node with a merge request in the mission, not a task of this agent.
+- It never changes a cluster. It isolates a Kubernetes workload only with a merge request to the GitOps repo of the buyer, through a Git host connector (`internal/isolate`).
+- It never names the cause finding as an input of the isolation merge request. The daemon would link the finding to it and set the status of the finding.
 
 ## Seams that are not built
 
@@ -84,7 +87,8 @@ Each value from the graph and from a tool result is untrusted data.
 | Key | Needed | Meaning |
 |---|---|---|
 | `incident` | yes | The key of the Incident node. |
-| `ir.task` | yes | `contain`, `cause` or `release`. |
+| `ir.task` | yes | `contain`, `cause`, `release`, `isolate` or `release_workload`. |
+| `ir.workload.*`, `ir.gitops.*` | for `isolate` and `release_workload` | The workload and the GitOps repo. The README lists each key. `ir.gitops.policy_kind` has no default. |
 
 The goal is not a fallback for the incident. The goal of a mission node is a sentence for a person, not a key. A dispatch with a missing or unknown key fails the run before any call.
 

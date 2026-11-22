@@ -1,0 +1,176 @@
+// SPDX-License-Identifier: Elastic-2.0
+// Copyright 2026 Zero Root AI
+
+package pass_test
+
+import (
+	"context"
+	"crypto/sha1" //nolint:gosec // git object ids are SHA-1 in a SHA-1 repository
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"testing"
+
+	"github.com/a2aproject/a2a-go/v2/a2a"
+	"github.com/zeroroot-ai/incident-agent/internal/incident"
+	"github.com/zeroroot-ai/incident-agent/internal/pass"
+	"github.com/zeroroot-ai/incident-agent/internal/respond"
+	"github.com/zeroroot-ai/sdk/agent"
+	"github.com/zeroroot-ai/sdk/finding"
+	"github.com/zeroroot-ai/sdk/openresponses"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/structpb"
+)
+
+// gitPlatform is a Platform with a mock Git host behind invoke_tool. It
+// records the properties that the agent writes on the Incident node.
+type gitPlatform struct {
+	calls   []string
+	records map[string]string
+	branch  string
+	merged  bool
+	changed []any
+	files   map[string]string
+}
+
+func (g *gitPlatform) CallToolProto(
+	_ context.Context, _ string, request, response proto.Message, _ ...agent.ToolCallOption,
+) error {
+	in := request.(*structpb.Struct).AsMap() //nolint:forcetypeassert // the test controls the request type
+	id, _ := in["id"].(string)
+	g.calls = append(g.calls, id)
+	args, _ := in["args"].(map[string]any)
+	var result map[string]any
+	switch id {
+	case "mcp:gitlab-fixloop:open_merge_request":
+		g.branch, _ = args["branch"].(string)
+		g.changed = listed(args["files"])
+		for _, f := range args["files"].([]any) { //nolint:forcetypeassert // the test controls the args
+			m := f.(map[string]any)                                //nolint:forcetypeassert // the test controls the args
+			g.files[m["path"].(string)], _ = m["content"].(string) //nolint:forcetypeassert // the test controls the args
+		}
+		result = map[string]any{"merge_request": "acme/manifests!4", "head_sha": headSHA}
+	case "mcp:gitlab-fixloop:merge_merge_request":
+		g.merged = true
+		result = map[string]any{"state": "merged", "merged": true}
+	case "mcp:gitlab-fixloop:merge_request_state":
+		state := "open"
+		if g.merged {
+			state = "merged"
+		}
+		result = map[string]any{"state": state, "source_branch": g.branch, "head_sha": headSHA, "changed_files": g.changed}
+	case "mcp:gitlab-fixloop:read_file":
+		c, found := g.files[args["path"].(string)] //nolint:forcetypeassert // the test controls the args
+		result = map[string]any{"found": found, "content": c}
+	default:
+		return errors.New("unknown tool " + id)
+	}
+	out, err := structpb.NewStruct(map[string]any{"result": result})
+	if err != nil {
+		return err //nolint:wrapcheck // a test helper
+	}
+	proto.Merge(response, out)
+	return nil
+}
+
+func (*gitPlatform) SubmitFinding(context.Context, *finding.Finding) error { return nil }
+
+func (*gitPlatform) GetFindings(context.Context, finding.Filter) ([]*finding.Finding, error) {
+	return nil, nil
+}
+
+func (g *gitPlatform) Observe(_ context.Context, obs agent.Observation) error {
+	if o, ok := obs.(agent.LifecycleEntityObservation); ok {
+		for k, v := range o.Properties {
+			g.records[k] = v
+		}
+	}
+	return nil
+}
+
+func (*gitPlatform) Model(context.Context, string) (*openresponses.Client, error) { return nil, nil }
+
+// listed turns the files of an open call into changed_files as the connector
+// returns it: a path, a kind of change and the git blob id, and no content.
+func listed(files any) []any {
+	list, _ := files.([]any)
+	out := make([]any, 0, len(list))
+	for _, f := range list {
+		m, _ := f.(map[string]any)
+		content, _ := m["content"].(string)
+		sum := sha1.Sum([]byte("blob " + strconv.Itoa(len(content)) + "\x00" + content)) //nolint:gosec // git
+		out = append(out, map[string]any{"path": m["path"], "change": "added", "blob_sha": hex.EncodeToString(sum[:])})
+	}
+	return out
+}
+
+const headSHA = "0123456789abcdef0123456789abcdef01234567"
+
+type liveReader struct{ g *gitPlatform }
+
+func (r liveReader) Incident(_ context.Context, key string) (incident.Incident, error) {
+	return incident.Incident{Key: key, Records: r.g.records}, nil
+}
+
+type noCalls struct{}
+
+func (noCalls) CheckCall(context.Context, string, respond.Action) error { return nil }
+
+func workloadTask(task string) agent.Task {
+	return agent.Task{Context: map[string]any{
+		pass.ContextKeyIncident: "incident-7", pass.ContextKeyTask: task,
+		pass.ContextKeyNamespace: "payments", pass.ContextKeyLabels: "app=ledger",
+		pass.ContextKeyConnector: "gitlab-fixloop", pass.ContextKeyProject: "acme/manifests",
+		pass.ContextKeyBaseBranch: "main", pass.ContextKeyPolicyKind: "cilium",
+	}}
+}
+
+func TestRun_IsolateOpensMergesAndRecords(t *testing.T) {
+	g := &gitPlatform{records: map[string]string{}, files: map[string]string{}}
+	res, err := pass.Run(context.Background(), g, liveReader{g}, noCalls{}, workloadTask(pass.TaskIsolate))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Status != a2a.TaskStateCompleted || res.Metadata["merged"] != true || res.Metadata["on_base"] != true {
+		t.Fatalf("status = %v, metadata = %v, output = %s", res.Status, res.Metadata, res.Output)
+	}
+	if len(g.calls) != 5 || !strings.HasPrefix(g.calls[0], "mcp:gitlab-fixloop:") {
+		t.Fatalf("calls = %v", g.calls)
+	}
+	found := false
+	for name := range g.records {
+		found = found || strings.HasPrefix(name, "ir_isolation_merged_")
+	}
+	if !found {
+		t.Fatalf("no isolated record: %v", g.records)
+	}
+	if strings.Contains(strings.ToLower(fmt.Sprint(res.Output)), "resolved") {
+		t.Fatalf("the report says that the incident is resolved: %s", res.Output)
+	}
+}
+
+func TestRun_WorkloadTaskRefusesBadContext(t *testing.T) {
+	for name, mutate := range map[string]func(map[string]any){
+		"no namespace":      func(m map[string]any) { delete(m, pass.ContextKeyNamespace) },
+		"system namespace":  func(m map[string]any) { m[pass.ContextKeyNamespace] = "kube-system" },
+		"no labels":         func(m map[string]any) { m[pass.ContextKeyLabels] = "" },
+		"not a git host":    func(m map[string]any) { m[pass.ContextKeyConnector] = "okta-response" },
+		"no policy kind":    func(m map[string]any) { delete(m, pass.ContextKeyPolicyKind) },
+		"github dir":        func(m map[string]any) { m[pass.ContextKeyDir] = ".github" },
+		"controller ns":     func(m map[string]any) { m[pass.ContextKeyNamespace] = "argocd" },
+		"no project":        func(m map[string]any) { delete(m, pass.ContextKeyProject) },
+		"label with a line": func(m map[string]any) { m[pass.ContextKeyLabels] = "a=b\nc: d" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := &gitPlatform{records: map[string]string{}, files: map[string]string{}}
+			task := workloadTask(pass.TaskIsolate)
+			mutate(task.Context)
+			res, err := pass.Run(context.Background(), g, liveReader{g}, noCalls{}, task)
+			if err == nil || res.Status != a2a.TaskStateFailed || len(g.calls) != 0 {
+				t.Fatalf("err = %v, status = %v, calls = %v", err, res.Status, g.calls)
+			}
+		})
+	}
+}
