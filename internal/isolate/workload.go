@@ -65,7 +65,7 @@ type Workload struct {
 // value that fails a check never reaches the file.
 func ParseWorkload(namespace, labels string) (Workload, error) {
 	ns := strings.TrimSpace(namespace)
-	if len(ns) == 0 || len(ns) > 63 || !dnsLabel.MatchString(ns) {
+	if ns == "" || len(ns) > 63 || !dnsLabel.MatchString(ns) {
 		return Workload{}, errors.New("isolate: the namespace is not a Kubernetes namespace name")
 	}
 	if systemNamespaces[ns] {
@@ -103,15 +103,15 @@ func ParseWorkload(namespace, labels string) (Workload, error) {
 func checkLabel(k, v string) error {
 	name := k
 	if prefix, rest, ok := strings.Cut(k, "/"); ok {
-		if len(prefix) == 0 || len(prefix) > 253 || !dnsPrefix.MatchString(prefix) {
+		if prefix == "" || len(prefix) > 253 || !dnsPrefix.MatchString(prefix) {
 			return errors.New("isolate: a label key has a prefix that is not a DNS name")
 		}
 		name = rest
 	}
-	if len(name) == 0 || len(name) > 63 || !labelPart.MatchString(name) {
+	if name == "" || len(name) > 63 || !labelPart.MatchString(name) {
 		return errors.New("isolate: a label key is not a Kubernetes label key")
 	}
-	if len(v) == 0 || len(v) > 63 || !labelPart.MatchString(v) {
+	if v == "" || len(v) > 63 || !labelPart.MatchString(v) {
 		return errors.New("isolate: a label value is not a Kubernetes label value")
 	}
 	return nil

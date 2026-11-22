@@ -26,7 +26,6 @@ import (
 type gitPlatform struct {
 	calls   []string
 	records map[string]string
-	status  string
 }
 
 func (g *gitPlatform) CallToolProto(
