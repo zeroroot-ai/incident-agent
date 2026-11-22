@@ -476,18 +476,27 @@ func filesProblem(mr MR, want Change) string {
 	}
 	for _, w := range want.Files {
 		g, ok := got[w.Path]
-		switch {
-		case !ok:
+		if !ok {
 			return "it does not change the expected file " + respond.Clean(w.Path)
-		case w.Delete && (g.Change != "deleted" || g.BlobSHA != ""):
-			return "it changes the file " + respond.Clean(w.Path) + " in another way than a delete"
-		case !w.Delete && ((g.Change != "added" && g.Change != "modified") ||
-			g.BlobSHA != gitBlobSHA(mr.HeadSHA, w.Content)):
-			return "it changes the file " + respond.Clean(w.Path) + " to a content that the agent did not write"
-		case !w.Delete && g.Mode != "" && g.Mode != regularMode:
-			return "it writes the file " + respond.Clean(w.Path) + " with the mode " + respond.Clean(g.Mode) +
-				" and the agent wrote " + regularMode
 		}
+		if problem := entryProblem(mr.HeadSHA, w, g); problem != "" {
+			return problem
+		}
+	}
+	return ""
+}
+
+// entryProblem says why one listed file is not the file that the agent
+// expects, or returns "".
+func entryProblem(head string, w File, g ChangedFile) string {
+	switch {
+	case w.Delete && (g.Change != "deleted" || g.BlobSHA != ""):
+		return "it changes the file " + respond.Clean(w.Path) + " in another way than a delete"
+	case !w.Delete && ((g.Change != "added" && g.Change != "modified") || g.BlobSHA != gitBlobSHA(head, w.Content)):
+		return "it changes the file " + respond.Clean(w.Path) + " to a content that the agent did not write"
+	case !w.Delete && g.Mode != "" && g.Mode != regularMode:
+		return "it writes the file " + respond.Clean(w.Path) + " with the mode " + respond.Clean(g.Mode) +
+			" and the agent wrote " + regularMode
 	}
 	return ""
 }
