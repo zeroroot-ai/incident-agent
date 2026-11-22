@@ -201,6 +201,10 @@ type MR struct {
 	// SourceBranch is the branch of the merge request. The connector omits
 	// it for a merge request from a fork.
 	SourceBranch string
+	// Files are the files that the merge request changes. FilesKnown is
+	// false when the host returned no list.
+	Files      []File
+	FilesKnown bool
 	// HeadSHA is the head commit of the branch. A person with push access can
 	// add a commit to the branch, so the agent compares it with the commit
 	// that it recorded when it opened the merge request.
@@ -292,7 +296,8 @@ func (h *ToolHost) State(ctx context.Context, ref string) (MR, Call, error) {
 	state, _ := r.Result["state"].(string)
 	branch, _ := r.Result["source_branch"].(string)
 	sha, _ := r.Result["head_sha"].(string)
-	return MR{State: state, SourceBranch: branch, HeadSHA: sha}, call, nil
+	files, known := changedFiles(r.Result["changed_files"])
+	return MR{State: state, SourceBranch: branch, HeadSHA: sha, Files: files, FilesKnown: known}, call, nil
 }
 
 // Merge implements Host. The connector merges only when the checks passed
@@ -327,4 +332,50 @@ func (h *ToolHost) ReadFile(ctx context.Context, path string) (content string, f
 	}
 	content, _ = r.Result["content"].(string)
 	return content, found, call, nil
+}
+
+// BypassNoteCluster is what the report and the incident record say about a
+// ClusterNetworkPolicy isolation. The peers of the API are namespaces, pods and
+// networks, so it cannot name a node.
+const BypassNoteCluster = "A ClusterNetworkPolicy does not deny ingress from nodes, from pods with hostNetwork, " +
+	"or from outside traffic that is translated to a node address. The policy API cannot express it. " +
+	"Use the policy kind cilium to deny these paths."
+
+// bypassNote returns the note for a kind that can be bypassed, or "" for a
+// kind that denies each path.
+func bypassNote(kind string) string {
+	switch kind {
+	case KindNetworkPolicy:
+		return BypassNote
+	case KindCluster:
+		return BypassNoteCluster
+	default:
+		return ""
+	}
+}
+
+// changedFiles reads the list changed_files of merge_request_state. Each entry
+// has a path, and either content or delete true. It returns false for a result
+// that has no list or a malformed entry. A malformed list never reads as an
+// empty change.
+func changedFiles(v any) ([]File, bool) {
+	list, ok := v.([]any)
+	if !ok {
+		return nil, false
+	}
+	out := make([]File, 0, len(list))
+	for _, e := range list {
+		m, ok := e.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		path, _ := m["path"].(string)
+		if path == "" {
+			return nil, false
+		}
+		del, _ := m["delete"].(bool)
+		content, _ := m["content"].(string)
+		out = append(out, File{Path: path, Content: content, Delete: del})
+	}
+	return out, true
 }

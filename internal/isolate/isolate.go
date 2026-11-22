@@ -27,7 +27,7 @@ const (
 	// recReverted says that the host shows the merged policy gone from the
 	// base branch. The generation is closed, and the next one isolates again.
 	recReverted = "ir_isolation_reverted_"
-	// recBypass holds BypassNote for a NetworkPolicy isolation.
+	// recBypass holds the bypass note of a kind that can be bypassed.
 	recBypass = "ir_isolation_bypass_"
 )
 
@@ -175,7 +175,7 @@ func (s step) confirmIsolation(ctx context.Context, done string) (bool, error) {
 		s.say("the record " + recName(recIsolated, s.key, s.gen) + " is not trusted: it holds no head commit")
 		return false, nil
 	}
-	merged, err := s.verify(ctx, m, IsolationBranch(s.key, s.gen))
+	merged, err := s.verify(ctx, m, s.p.Repo.Isolate(s.inc, s.w, s.gen))
 	if err != nil || !merged {
 		return false, err
 	}
@@ -212,7 +212,7 @@ func (s step) isolate(ctx context.Context, opened string) (Summary, error) {
 			return *s.sum, nil
 		}
 	}
-	merged, err := s.drive(ctx, m, IsolationBranch(s.key, s.gen))
+	merged, err := s.drive(ctx, m, s.p.Repo.Isolate(s.inc, s.w, s.gen))
 	if err != nil || !merged {
 		return *s.sum, err
 	}
@@ -225,9 +225,10 @@ func (s step) isolate(ctx context.Context, opened string) (Summary, error) {
 		return *s.sum, err
 	}
 	s.sum.OnBase = present == presentYes
-	if s.p.Repo.PolicyKind == KindNetworkPolicy {
-		s.say("caution: " + BypassNote)
-		return *s.sum, s.write(ctx, recName(recBypass, s.key, s.gen), BypassNote)
+	if bypassNote(s.p.Repo.PolicyKind) != "" {
+		note := bypassNote(s.p.Repo.PolicyKind)
+		s.say("caution: " + note)
+		return *s.sum, s.write(ctx, recName(recBypass, s.key, s.gen), note)
 	}
 	return *s.sum, nil
 }
@@ -262,7 +263,7 @@ func (p Pass) Release(ctx context.Context, key string, w Workload) (Summary, err
 	if err != nil || !cont {
 		return sum, err
 	}
-	merged, err := run.verify(ctx, isolated, IsolationBranch(ck, gen))
+	merged, err := run.verify(ctx, isolated, p.Repo.Isolate(key, w, gen))
 	if err != nil || !merged {
 		return sum, err
 	}
@@ -295,7 +296,7 @@ func (s step) release(ctx context.Context, isolated mrRecord, opened string) (Su
 			return *s.sum, nil
 		}
 	}
-	merged, err := s.drive(ctx, m, ReleaseBranch(s.key, s.gen))
+	merged, err := s.drive(ctx, m, s.p.Repo.Release(s.inc, s.w, s.gen))
 	if err != nil || !merged {
 		return *s.sum, err
 	}
@@ -332,7 +333,7 @@ func (s step) settleOpen(ctx context.Context, opened string) (m mrRecord, cont b
 		s.say("the record " + recName(recIsolationOpened, s.key, s.gen) + " is not trusted: it holds no head commit")
 		return mrRecord{}, false, nil
 	}
-	mr, ok, err := s.read(ctx, m, IsolationBranch(s.key, s.gen))
+	mr, ok, err := s.read(ctx, m, s.p.Repo.Isolate(s.inc, s.w, s.gen))
 	if err != nil || !ok {
 		return mrRecord{}, false, err
 	}
@@ -412,7 +413,7 @@ func short(sha string) string {
 // project, on the expected branch, and at the head commit that the agent
 // recorded. A record names the reference, and any writer of the graph can
 // write a record. The host is the fact.
-func (s step) read(ctx context.Context, m mrRecord, branch string) (MR, bool, error) {
+func (s step) read(ctx context.Context, m mrRecord, want Change) (MR, bool, error) {
 	if problem := s.p.Repo.refProblem(m.Ref); problem != "" {
 		s.say("the merge request " + respond.Clean(m.Ref) + " is not trusted: " + problem)
 		return MR{}, false, nil
@@ -424,10 +425,10 @@ func (s step) read(ctx context.Context, m mrRecord, branch string) (MR, bool, er
 	if s.outcome("read the state of "+respond.Clean(m.Ref), call) {
 		return MR{}, false, nil
 	}
-	if mr.SourceBranch != branch {
+	if mr.SourceBranch != want.Branch {
 		s.say("the merge request " + respond.Clean(m.Ref) + " is on the branch " +
 			strconv.Quote(respond.Clean(mr.SourceBranch)) + " and the expected branch is " +
-			strconv.Quote(branch) + ": it is not trusted")
+			strconv.Quote(want.Branch) + ": it is not trusted")
 		return MR{}, false, nil
 	}
 	if mr.HeadSHA != m.SHA {
@@ -436,12 +437,44 @@ func (s step) read(ctx context.Context, m mrRecord, branch string) (MR, bool, er
 			"so it is not trusted")
 		return MR{}, false, nil
 	}
+	if problem := filesProblem(mr, want); problem != "" {
+		s.say("the merge request " + respond.Clean(m.Ref) + " is not trusted: " + problem)
+		return MR{}, false, nil
+	}
 	return mr, true, nil
 }
 
+// filesProblem says why the files that the merge request changes are not the
+// files of the expected change, or returns "". The branch name is easy to
+// guess, so a person can make the branch first and the commit of the agent
+// lands on top of theirs. The head commit then names that history too. So
+// the agent compares the files, and it merges only an exact match.
+func filesProblem(mr MR, want Change) string {
+	if !mr.FilesKnown {
+		return "the host does not return the files that the merge request changes"
+	}
+	if len(mr.Files) != len(want.Files) {
+		return fmt.Sprintf("it changes %d files and the expected change has %d", len(mr.Files), len(want.Files))
+	}
+	got := map[string]File{}
+	for _, f := range mr.Files {
+		got[f.Path] = f
+	}
+	for _, w := range want.Files {
+		g, ok := got[w.Path]
+		switch {
+		case !ok:
+			return "it does not change the expected file " + respond.Clean(w.Path)
+		case g.Delete != w.Delete || (!w.Delete && g.Content != w.Content):
+			return "it changes the file " + respond.Clean(w.Path) + " in another way than expected"
+		}
+	}
+	return ""
+}
+
 // verify reports whether the host shows the merge request merged.
-func (s step) verify(ctx context.Context, m mrRecord, branch string) (bool, error) {
-	mr, ok, err := s.read(ctx, m, branch)
+func (s step) verify(ctx context.Context, m mrRecord, want Change) (bool, error) {
+	mr, ok, err := s.read(ctx, m, want)
 	if err != nil || !ok {
 		return false, err
 	}
@@ -459,8 +492,8 @@ func (s step) verify(ctx context.Context, m mrRecord, branch string) (bool, erro
 // merge call, which the host refuses. The merge call carries the recorded
 // head commit, so the host refuses the merge when a commit came after the
 // read. It reads the state again after the merge call.
-func (s step) drive(ctx context.Context, m mrRecord, branch string) (bool, error) {
-	mr, ok, err := s.read(ctx, m, branch)
+func (s step) drive(ctx context.Context, m mrRecord, want Change) (bool, error) {
+	mr, ok, err := s.read(ctx, m, want)
 	if err != nil || !ok {
 		return false, err
 	}
@@ -486,7 +519,7 @@ func (s step) drive(ctx context.Context, m mrRecord, branch string) (bool, error
 			": the checks are not done, a rule blocks it, or the head moved. The next dispatch reads it again")
 		return false, nil
 	}
-	return s.verify(ctx, m, branch)
+	return s.verify(ctx, m, want)
 }
 
 // The answers of policyOnBase.

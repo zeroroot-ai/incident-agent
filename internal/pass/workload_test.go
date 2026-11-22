@@ -28,6 +28,7 @@ type gitPlatform struct {
 	records map[string]string
 	branch  string
 	merged  bool
+	changed []any
 	files   map[string]string
 }
 
@@ -42,6 +43,7 @@ func (g *gitPlatform) CallToolProto(
 	switch id {
 	case "mcp:gitlab-fixloop:open_merge_request":
 		g.branch, _ = args["branch"].(string)
+		g.changed, _ = args["files"].([]any)
 		for _, f := range args["files"].([]any) { //nolint:forcetypeassert // the test controls the args
 			m := f.(map[string]any)                                //nolint:forcetypeassert // the test controls the args
 			g.files[m["path"].(string)], _ = m["content"].(string) //nolint:forcetypeassert // the test controls the args
@@ -55,7 +57,7 @@ func (g *gitPlatform) CallToolProto(
 		if g.merged {
 			state = "merged"
 		}
-		result = map[string]any{"state": state, "source_branch": g.branch, "head_sha": headSHA}
+		result = map[string]any{"state": state, "source_branch": g.branch, "head_sha": headSHA, "changed_files": g.changed}
 	case "mcp:gitlab-fixloop:read_file":
 		c, found := g.files[args["path"].(string)] //nolint:forcetypeassert // the test controls the args
 		result = map[string]any{"found": found, "content": c}

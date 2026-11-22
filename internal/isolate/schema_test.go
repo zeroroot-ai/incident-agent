@@ -236,7 +236,10 @@ func str(v any, n map[string]any, path string) []string {
 		errs = append(errs, fmt.Sprintf("%s: %q is longer than %v", path, x, lim))
 	}
 	if pat, has := n["pattern"].(string); has {
-		if re, err := regexp.Compile(pat); err == nil && !re.MatchString(x) {
+		// A pattern that RE2 cannot compile is not a pass. The test says so.
+		if re, err := regexp.Compile(pat); err != nil {
+			errs = append(errs, fmt.Sprintf("%s: the pattern %s does not compile: %v", path, pat, err))
+		} else if !re.MatchString(x) {
 			errs = append(errs, fmt.Sprintf("%s: %q does not match %s", path, x, pat))
 		}
 	}
@@ -356,5 +359,13 @@ func TestSchemaValidatorRejectsABrokenPolicy(t *testing.T) {
 				t.Fatalf("the validator accepted a broken policy")
 			}
 		})
+	}
+}
+
+func TestSchemaValidatorFailsOnAPatternThatRE2CannotCompile(t *testing.T) {
+	var set schemaSet
+	errs := set.validate("x", map[string]any{"type": "string", "pattern": "(?<=a)x"}, "p")
+	if len(errs) != 1 || !strings.Contains(errs[0], "does not compile") {
+		t.Fatalf("errs = %v", errs)
 	}
 }
