@@ -249,9 +249,14 @@ func (g *gitHost) merge(response proto.Message, ref string, args map[string]any)
 	if g.beforeMerge != nil {
 		g.beforeMerge(ref)
 	}
-	// GitHub refuses the merge with HTTP 409 when the head is not the sha of
-	// the call. The connector then returns merged false.
-	if expected, _ := args["sha"].(string); expected != m.sha {
+	// The connector of v0.5.0 requires expected_head_sha and refuses an empty
+	// value. GitHub refuses the merge with HTTP 409 when the head is not that
+	// sha. The connector then returns merged false.
+	expected, _ := args["expected_head_sha"].(string)
+	if expected == "" {
+		return errors.New("connector mcp: merge_merge_request on \"x\" reported an error: check expected_head_sha: expected_head_sha is required")
+	}
+	if expected != m.sha {
 		return g.answer(response, map[string]any{"state": m.state, "merged": false})
 	}
 	if g.green {

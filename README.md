@@ -98,7 +98,7 @@ The records on the Incident are `ir_isolation_opened_`, `ir_isolation_merged_`, 
 
 | Tool | State | Source |
 |---|---|---|
-| `merge_request_state`, `merge_merge_request` | Exist in `github-fixloop` and `gitlab-fixloop` v0.2.0. `merge_request_state` returns `source_branch`. It must also return `head_sha`, and `merge_merge_request` must take the input `sha` and refuse the merge when the head differs. GitHub and GitLab both accept a sha on merge. | `zeroroot-ai/connectors` |
+| `merge_request_state`, `merge_merge_request` | Exist in `github-fixloop` and `gitlab-fixloop` v0.5.0. `merge_request_state` returns `source_branch` and `head_sha`. `merge_merge_request` takes the expected head as `expected_head_sha`, refuses an empty value, and refuses the merge when the head differs. | `zeroroot-ai/connectors` |
 | `open_merge_request`, `close_merge_request`, `read_file` | Do not exist. A call fails with a daemon refusal and changes nothing. | Contract below |
 
 The contract, for `zeroroot-ai/connectors`.

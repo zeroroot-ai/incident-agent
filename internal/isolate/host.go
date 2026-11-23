@@ -24,10 +24,10 @@ import (
 // manifests github-fixloop.yaml and gitlab-fixloop.yaml).
 var gitHosts = map[string]bool{"github-fixloop": true, "gitlab-fixloop": true}
 
-// The tools of a Git host connector. The first two exist in v0.2.0 of the
-// servers in zeroroot-ai/connectors. The other three do not exist yet. The
-// daemon refuses a call of a tool that does not exist, and the call changes
-// nothing. The README states the contract of each.
+// The tools of a Git host connector. All five exist in v0.5.0 of the servers
+// in zeroroot-ai/connectors. The merge tool takes the expected head as
+// expected_head_sha, and it refuses an empty value. The README states the
+// contract of each.
 const (
 	// ToolState reads the state of a merge request.
 	ToolState = "merge_request_state"
@@ -319,7 +319,7 @@ func (h *ToolHost) State(ctx context.Context, ref string) (MR, Call, error) {
 // Merge implements Host. The connector merges only when the checks passed
 // and the daemon grants the merge. The result says whether it merged.
 func (h *ToolHost) Merge(ctx context.Context, ref, sha string) (bool, Call, error) {
-	r, call, err := h.call(ctx, ToolMerge, map[string]any{"merge_request": ref, "sha": sha})
+	r, call, err := h.call(ctx, ToolMerge, map[string]any{"merge_request": ref, "expected_head_sha": sha})
 	if err != nil || !call.Done() {
 		return false, call, err
 	}
