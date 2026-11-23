@@ -604,7 +604,7 @@ func TestIsolate_EditedPolicyCountsAsReverted(t *testing.T) {
 func TestIsolate_NoReadFileToolMeansMergedAndNotConfirmed(t *testing.T) {
 	g, _, p := setup(t)
 	w := workload(t)
-	// The merge works. The read tool does not exist yet.
+	// The merge works. This connector has no read_file tool, as an older one.
 	if _, err := p.Isolate(context.Background(), incidentKey, w); err != nil {
 		t.Fatalf("first: %v", err)
 	}
