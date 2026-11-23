@@ -55,9 +55,9 @@ func forge(g *gitHost, ref, state, branch string) string {
 //     on each call.
 //   - A merge applies its files to the base branch. read_file reads that
 //     branch. revert undoes a merge.
-//   - open_merge_request, close_merge_request and read_file do not exist in
-//     v0.2.0 of the server. The mock answers them only when tools is true.
-//     Otherwise the daemon refuses them as an unknown tool.
+//   - open_merge_request, close_merge_request and read_file exist from v0.3.0
+//     of the server. The mock answers them only when tools is true, to test an
+//     older connector. Otherwise the daemon refuses them as an unknown tool.
 //
 // The mock fails the test when the agent calls a tool that a containment
 // must not call: the health signal of a deploy, or the revert.
@@ -459,8 +459,8 @@ func TestIsolate_DaemonRefusalRecordsNothing(t *testing.T) {
 	}
 }
 
-// The connectors of v0.2.0 have no open_merge_request. The daemon answers
-// with an unknown tool, and the pass must change nothing and say why.
+// An older connector has no open_merge_request. The daemon answers with an
+// unknown tool, and the pass must change nothing and say why.
 func TestIsolate_ConnectorWithoutTheOpenTool(t *testing.T) {
 	g, st, p := setup(t)
 	g.tools = false

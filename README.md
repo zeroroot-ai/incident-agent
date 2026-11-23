@@ -13,7 +13,7 @@ It is built with the ADK the way `cve-triage` and `fix-agent` are built. The pro
 | `internal/incident` | The shape of one incident: alerts, places, causes, records. | done |
 | `internal/respond` | The closed table of response connectors, the call of `invoke_tool`, and the outcome of each call. | done, tested with a fake in the shapes of the daemon |
 | `internal/contain` | The containment pass and the release pass. | done, tested with fakes |
-| `internal/isolate` | The isolation of one Kubernetes workload and its release, as merge requests to the GitOps repo of the buyer. | done, tested with a mock Git host. Three connector tools do not exist yet (open item 9) |
+| `internal/isolate` | The isolation of one Kubernetes workload and its release, as merge requests to the GitOps repo of the buyer. | done, tested with a mock Git host in the shapes of connectors v0.5.0 |
 | `internal/cause` | One model call, one finding of the cause, and the `CAUSED_BY` link. | done, tested with fakes |
 | `internal/emit` | The records on the Incident node and the cause link. | done, tested with fakes |
 | `internal/read` | The read of one incident, and the check of a tool call of the agent. | not served: the daemon has no incident read and no tool call read for an agent |
@@ -98,13 +98,12 @@ The records on the Incident are `ir_isolation_opened_`, `ir_isolation_merged_`, 
 
 | Tool | State | Source |
 |---|---|---|
-| `merge_request_state`, `merge_merge_request` | Exist in `github-fixloop` and `gitlab-fixloop` v0.5.0. `merge_request_state` returns `source_branch` and `head_sha`. `merge_merge_request` takes the expected head as `expected_head_sha`, refuses an empty value, and refuses the merge when the head differs. | `zeroroot-ai/connectors` |
-| `open_merge_request`, `close_merge_request`, `read_file` | Do not exist. A call fails with a daemon refusal and changes nothing. | Contract below |
+| `merge_request_state`, `merge_merge_request`, `open_merge_request`, `close_merge_request`, `read_file` | Exist in `github-fixloop` and `gitlab-fixloop` v0.5.0. | `zeroroot-ai/connectors` |
 
-The contract, for `zeroroot-ai/connectors`.
+The inputs and results at v0.5.0.
 
 - `open_merge_request` takes `project`, `base_branch`, `branch`, `title`, `description` and `files`. Each file has a `path`, and either `content` or `delete: true`. The tool writes a `content` file whether it exists or not. The result is `{"merge_request": "<project>#<number>", "head_sha": "<commit>"}` for GitHub, and `<project>!<number>` for GitLab. `head_sha` is the head commit of the new branch. The same `branch` called two times opens one merge request. The tool commits all files in one commit. It makes the branch from `base_branch`. It refuses a branch that exists already with commits other than its own, and the refusal changes nothing.
-- `merge_request_state` adds the result fields `head_sha` and `changed_files`. `changed_files` is the list of the files that the merge request changes. Each entry has `path`, `change` (`added`, `modified`, `deleted`, `renamed` or `mode_changed`), `previous_path` (for a rename), `blob_sha` and `mode`. `blob_sha` is the git blob id of the file after the change, and it is empty for a deleted file. The list holds no content. The result also has the flag `changed_files_truncated`, which is true when the connector cut the list, and the text `changed_files_error`, which says why the connector could not make the list (for example, the head moved while it read the files). The agent refuses a cut list. `merge_merge_request` takes the input `sha`. When the head of the merge request is another commit, it merges nothing and returns `merged: false`.
+- `merge_request_state` returns `state`, `source_branch`, `head_sha` and `changed_files`. `changed_files` is the list of the files that the merge request changes. Each entry has `path`, `change` (`added`, `modified`, `deleted`, `renamed` or `mode_changed`), `previous_path` (for a rename), `blob_sha` and `mode`. `blob_sha` is the git blob id of the file after the change, and it is empty for a deleted file. The list holds no content. The result also has the flag `changed_files_truncated`, which is true when the connector cut the list, and the text `changed_files_error`, which says why the connector could not make the list (for example, the head moved while it read the files). The agent refuses a cut list. `merge_merge_request` takes `merge_request` and the expected head as `expected_head_sha`, and it refuses an empty value. When the head of the merge request is another commit, it merges nothing and returns `merged: false`.
 - `close_merge_request` takes `merge_request` and closes it without a merge.
 - `read_file` takes `project`, `ref` and `path`. The result is `{"found": <bool>, "content": "<text>"}`. A result with no `found` is a failure.
 
@@ -112,12 +111,11 @@ Vendor endpoints. GitHub: https://docs.github.com/en/rest/git/commits, https://d
 
 ### Gaps that need other repos
 
-1. **The three tools** (`zeroroot-ai/connectors`). See the contract above.
-2. **The merge slot** (gibson). `merge_merge_request` has the role `merge`. The daemon runs it only when the merge request holds a granted slot. The watcher grants a slot only to a merge request that a finding names with `FIXED_BY`, and only for a finding that an Application owns. An isolation merge request has no finding, so the daemon refuses the merge today. The merge request must not name the cause finding. The daemon would then set the cause to `fixing` and could verify it by the isolation.
-3. **The no-revert rule in the daemon** (gibson). The watcher reverts only a merge request that a fix job delivered for a finding. The isolation has no finding, so the watcher does not revert it today. A rule that says so, with a test, does not exist. The incident report also needs a marker to tell an isolation from a fix.
-4. **The reads** (gibson#1573). Each task still needs the incident read.
-5. **The author and the tags of a finding** (gibson). The daemon drops both on write (`protoFindingToFinding`) and on read (`agentFindingToProto`). Until it keeps them, no cause finding is bound to this agent, and each release waits.
-6. **The source of the workload labels** (gibson, the mission). See the limit above.
+1. **The merge slot** (gibson). `merge_merge_request` has the role `merge`. The daemon runs it only when the merge request holds a granted slot. The watcher grants a slot only to a merge request that a finding names with `FIXED_BY`, and only for a finding that an Application owns. An isolation merge request has no finding, so the daemon refuses the merge today. The merge request must not name the cause finding. The daemon would then set the cause to `fixing` and could verify it by the isolation.
+2. **The no-revert rule in the daemon** (gibson). The watcher reverts only a merge request that a fix job delivered for a finding. The isolation has no finding, so the watcher does not revert it today. A rule that says so, with a test, does not exist. The incident report also needs a marker to tell an isolation from a fix.
+3. **The reads** (gibson#1573). Each task still needs the incident read.
+4. **The author and the tags of a finding** (gibson). The daemon drops both on write (`protoFindingToFinding`) and on read (`agentFindingToProto`). Until it keeps them, no cause finding is bound to this agent, and each release waits.
+5. **The source of the workload labels** (gibson, the mission). See the limit above.
 
 ## Develop
 
