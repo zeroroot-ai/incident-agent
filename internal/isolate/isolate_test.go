@@ -55,9 +55,9 @@ func forge(g *gitHost, ref, state, branch string) string {
 //     on each call.
 //   - A merge applies its files to the base branch. read_file reads that
 //     branch. revert undoes a merge.
-//   - open_merge_request, close_merge_request and read_file do not exist in
-//     v0.2.0 of the server. The mock answers them only when tools is true.
-//     Otherwise the daemon refuses them as an unknown tool.
+//   - open_merge_request, close_merge_request and read_file exist from v0.3.0
+//     of the server. The mock answers them only when tools is true, to test an
+//     older connector. Otherwise the daemon refuses them as an unknown tool.
 //
 // The mock fails the test when the agent calls a tool that a containment
 // must not call: the health signal of a deploy, or the revert.
@@ -249,9 +249,14 @@ func (g *gitHost) merge(response proto.Message, ref string, args map[string]any)
 	if g.beforeMerge != nil {
 		g.beforeMerge(ref)
 	}
-	// GitHub refuses the merge with HTTP 409 when the head is not the sha of
-	// the call. The connector then returns merged false.
-	if expected, _ := args["sha"].(string); expected != m.sha {
+	// The connector of v0.5.0 requires expected_head_sha and refuses an empty
+	// value. GitHub refuses the merge with HTTP 409 when the head is not that
+	// sha. The connector then returns merged false.
+	expected, _ := args["expected_head_sha"].(string)
+	if expected == "" {
+		return errors.New("connector mcp: merge_merge_request on \"x\" reported an error: check expected_head_sha: expected_head_sha is required")
+	}
+	if expected != m.sha {
 		return g.answer(response, map[string]any{"state": m.state, "merged": false})
 	}
 	if g.green {
@@ -454,8 +459,8 @@ func TestIsolate_DaemonRefusalRecordsNothing(t *testing.T) {
 	}
 }
 
-// The connectors of v0.2.0 have no open_merge_request. The daemon answers
-// with an unknown tool, and the pass must change nothing and say why.
+// An older connector has no open_merge_request. The daemon answers with an
+// unknown tool, and the pass must change nothing and say why.
 func TestIsolate_ConnectorWithoutTheOpenTool(t *testing.T) {
 	g, st, p := setup(t)
 	g.tools = false
@@ -599,7 +604,7 @@ func TestIsolate_EditedPolicyCountsAsReverted(t *testing.T) {
 func TestIsolate_NoReadFileToolMeansMergedAndNotConfirmed(t *testing.T) {
 	g, _, p := setup(t)
 	w := workload(t)
-	// The merge works. The read tool does not exist yet.
+	// The merge works. This connector has no read_file tool, as an older one.
 	if _, err := p.Isolate(context.Background(), incidentKey, w); err != nil {
 		t.Fatalf("first: %v", err)
 	}
